@@ -62,15 +62,44 @@ _rx_non_alnum_space = re.compile(r"[^0-9a-zA-ZÀ-ÿ ]+")
 _rx_spaces = re.compile(r"\s+")
 
 def normalize_name(s: str) -> str:
+    """Normalize a person name for matching.
+
+    Lowercases, strips, removes non-alphanumeric characters (keeping spaces),
+    and collapses whitespace.
+
+    Args:
+        s: Raw input string.
+
+    Returns:
+        Normalized string.
+    """
     s = (s or "").strip().lower()
     s = _rx_non_alnum_space.sub(" ", s)
     s = _rx_spaces.sub(" ", s).strip()
     return s
 
 def to_key(s: str) -> str:
+    """Build a compact key version of a name for prefix lookups.
+
+    Args:
+        s: Raw input string.
+
+    Returns:
+        Normalized name with spaces removed.
+    """
     return normalize_name(s).replace(" ", "")
 
 def build_boolean_query(tokens: List[str]) -> str:
+    """Build a MariaDB FULLTEXT boolean query from normalized tokens.
+
+    Tokens of length >= 4 get a trailing '*' for prefix matching.
+
+    Args:
+        tokens: List of normalized tokens.
+
+    Returns:
+        A boolean-mode query string suitable for `AGAINST (... IN BOOLEAN MODE)`.
+    """
     # MariaDB boolean mode: +token* forces token presence, * is prefix
     parts = []
     for t in tokens:
@@ -84,6 +113,17 @@ def build_boolean_query(tokens: List[str]) -> str:
 # DB Helpers
 # ----------------------------
 def get_db_connection():
+    """Create a PyMySQL connection using environment variables.
+
+    Uses `DictCursor` so `fetchone()` / `fetchall()` return dictionaries.
+    Expects MySQL/MariaDB parameter style `%s`.
+
+    Environment variables:
+        DB_HOST, DB_PORT, DB_USER, DB_PASS/DB_PASSWORD, DB_NAME
+
+    Returns:
+        A live `pymysql.Connection`.
+    """
     strdbhost = os.getenv("DB_HOST", DB_HOST)
     lngdbport = int(os.getenv("DB_PORT", str(DB_PORT)))
     strdbuser = os.getenv("DB_USER", DB_USER)
@@ -104,6 +144,14 @@ def get_db_connection():
     )
 
 def db_has_norm_columns(cur) -> bool:
+    """Check if required generated columns exist on the target table.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+
+    Returns:
+        True if both `PERSON_NAME_NORM` and `PERSON_NAME_KEY` exist.
+    """
     # Check for PERSON_NAME_NORM and PERSON_NAME_KEY existence
     cur.execute("""
         SELECT COUNT(*) AS cnt
@@ -116,6 +164,14 @@ def db_has_norm_columns(cur) -> bool:
     return row["cnt"] == 2
 
 def db_has_fulltext(cur) -> bool:
+    """Check whether a FULLTEXT index exists on `PERSON_NAME_NORM`.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+
+    Returns:
+        True if a FULLTEXT index is found, otherwise False.
+    """
     # crude check: whether any FULLTEXT index exists on PERSON_NAME_NORM
     cur.execute(f"""
         SHOW INDEX FROM {TABLE}
@@ -124,6 +180,15 @@ def db_has_fulltext(cur) -> bool:
     return cur.fetchone() is not None
 
 def exact_match(cur, q_norm: str) -> Optional[Dict[str, Any]]:
+    """Find an exact normalized match in the database.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+        q_norm: Normalized query string.
+
+    Returns:
+        A row dict if found, else None.
+    """
     # Exact match on normalized form (fast with index on PERSON_NAME_NORM)
     cur.execute(f"""
         SELECT ID_PERSON, PERSON_NAME, PERSON_NAME_NORM
@@ -138,6 +203,22 @@ def exact_match(cur, q_norm: str) -> Optional[Dict[str, Any]]:
     return row
 
 def fetch_candidates(cur, q_norm: str, q_key: str, has_fulltext: bool) -> List[Tuple[int, str, str]]:
+    """Fetch candidate rows that may match the query.
+
+    Strategy:
+        1) Prefix lookup on `PERSON_NAME_KEY`.
+        2) Optional FULLTEXT fallback on `PERSON_NAME_NORM`.
+        3) LIKE fallback as last resort.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+        q_norm: Normalized query string.
+        q_key: Key form of query (normalized without spaces).
+        has_fulltext: Whether FULLTEXT is available on `PERSON_NAME_NORM`.
+
+    Returns:
+        A list of row dicts with at least `ID_PERSON`, `PERSON_NAME`, `PERSON_NAME_NORM`.
+    """
     # 1) Prefix on PERSON_NAME_KEY (index-friendly)
     prefix_len = 6 if len(q_key) >= 6 else max(3, len(q_key))
     prefix = q_key[:prefix_len]
@@ -193,6 +274,15 @@ def fetch_candidates(cur, q_norm: str, q_key: str, has_fulltext: bool) -> List[T
 # RapidFuzz decision logic
 # ----------------------------
 def rank_candidates(q_norm: str, candidates: List[Tuple[int, str, str]]) -> List[Dict[str, Any]]:
+    """Rank candidate rows by lexical similarity using RapidFuzz.
+
+    Args:
+        q_norm: Normalized query string.
+        candidates: Candidate row dicts.
+
+    Returns:
+        A list of dicts containing the candidate fields plus a `SCORE` float.
+    """
     # Dict choices: id -> norm for scoring
     choices = {row["ID_PERSON"]: row["PERSON_NAME_NORM"] for row in candidates}
     matches = process.extract(q_norm, choices, scorer=fuzz.WRatio, limit=TOP_K)
@@ -210,6 +300,16 @@ def rank_candidates(q_norm: str, candidates: List[Tuple[int, str, str]]) -> List
     return out
 
 def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """Decide whether to auto-correct based on the top ranked candidates.
+
+    Uses `AUTO_SCORE` and `MIN_MARGIN` as thresholds.
+
+    Args:
+        ranked: Ranked candidates from `rank_candidates()`.
+
+    Returns:
+        Tuple of (should_autocorrect, best_candidate_or_none, reason_string).
+    """
     if not ranked:
         return (False, None, "no_candidates")
 
@@ -226,6 +326,7 @@ def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dic
 # Main interactive loop
 # ----------------------------
 def main():
+    """Run the interactive CLI loop."""
     conn = get_db_connection()
     cur = conn.cursor()
 
