@@ -52,6 +52,7 @@ COL_ID_PERSON = "ID_PERSON"
 COL_PERSON_NAME = "PERSON_NAME"
 COL_PERSON_NAME_NORM = "PERSON_NAME_NORM"
 COL_PERSON_NAME_KEY = "PERSON_NAME_KEY"
+COL_POPULARITY = "POPULARITY"
 
 # Environment variables (recommended)
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
@@ -201,6 +202,7 @@ def exact_match(
     strcolumnid: str,
     strcolumndesc: str,
     strcolumndescnorm: str,
+    strcolumnpopularity: str,
     q_norm: str,
 ) -> Optional[Dict[str, Any]]:
     """Find an exact normalized match in the database.
@@ -215,7 +217,7 @@ def exact_match(
     # Exact match on normalized form (fast with index on PERSON_NAME_NORM)
     cur.execute(
         f"""
-        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
         FROM `{strtablename}`
         WHERE `{strcolumndescnorm}` = %s
         LIMIT 1
@@ -234,6 +236,7 @@ def fetch_candidates(
     strcolumndesc: str,
     strcolumndescnorm: str,
     strcolumndesckey: str,
+    strcolumnpopularity: str,
     q_norm: str,
     q_key: str,
     has_fulltext: bool,
@@ -263,7 +266,7 @@ def fetch_candidates(
     t0 = time.perf_counter() if timings is not None else 0.0
     cur.execute(
         f"""
-        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
         FROM `{strtablename}`
         WHERE `{strcolumndesckey}` LIKE CONCAT(%s, '%%')
         LIMIT %s
@@ -287,7 +290,7 @@ def fetch_candidates(
         ftx_query = build_boolean_query(tokens)
         cur.execute(
             f"""
-            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
             FROM `{strtablename}`
             WHERE MATCH(`{strcolumndescnorm}`) AGAINST (%s IN BOOLEAN MODE)
             LIMIT %s
@@ -312,7 +315,7 @@ def fetch_candidates(
         t = tokens[0]
         cur.execute(
             f"""
-            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
             FROM `{strtablename}`
             WHERE `{strcolumndescnorm}` LIKE CONCAT('%%', %s, '%%')
             LIMIT %s
@@ -339,6 +342,7 @@ def rank_candidates(
     strcolumnid: str,
     strcolumndesc: str,
     strcolumndescnorm: str,
+    strcolumnpopularity: str,
     q_norm: str,
     candidates: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -363,8 +367,16 @@ def rank_candidates(
             strcolumnid: r[strcolumnid],
             strcolumndesc: r[strcolumndesc],
             strcolumndescnorm: r[strcolumndescnorm],
+            strcolumnpopularity: r.get(strcolumnpopularity),
             "SCORE": float(score),
         })
+
+    out.sort(
+        key=lambda d: (
+            -d["SCORE"],
+            -(d.get(strcolumnpopularity) or 0),
+        )
+    )
     return out
 
 def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]], str]:
@@ -403,6 +415,7 @@ def main():
     strcolumndesc = COL_PERSON_NAME
     strcolumndescnorm = COL_PERSON_NAME_NORM
     strcolumndesckey = COL_PERSON_NAME_KEY
+    strcolumnpopularity = COL_POPULARITY
 
     if not db_has_norm_columns(cur, strtablename, strcolumndescnorm, strcolumndesckey):
         print(
@@ -433,7 +446,15 @@ def main():
         q_key = to_key(raw)
 
         t_exact0 = time.perf_counter() if TIMINGS else 0.0
-        hit = exact_match(cur, strtablename, strcolumnid, strcolumndesc, strcolumndescnorm, q_norm)
+        hit = exact_match(
+            cur,
+            strtablename,
+            strcolumnid,
+            strcolumndesc,
+            strcolumndescnorm,
+            strcolumnpopularity,
+            q_norm,
+        )
 
         t_exact1 = time.perf_counter() if TIMINGS else 0.0
         if hit:
@@ -452,6 +473,7 @@ def main():
             strcolumndesc,
             strcolumndescnorm,
             strcolumndesckey,
+            strcolumnpopularity,
             q_norm,
             q_key,
             has_fulltext,
@@ -461,7 +483,14 @@ def main():
         t_fetch1 = time.perf_counter() if TIMINGS else 0.0
 
         t_rank0 = time.perf_counter() if TIMINGS else 0.0
-        ranked = rank_candidates(strcolumnid, strcolumndesc, strcolumndescnorm, q_norm, candidates)
+        ranked = rank_candidates(
+            strcolumnid,
+            strcolumndesc,
+            strcolumndescnorm,
+            strcolumnpopularity,
+            q_norm,
+            candidates,
+        )
 
         t_rank1 = time.perf_counter() if TIMINGS else 0.0
 
@@ -480,7 +509,11 @@ def main():
         else:
             print(f"  Not confident to auto-correct ({reason}). Top suggestions:")
             for i, r in enumerate(ranked, 1):
-                print(f"  {i:2d}. {r[strcolumndesc]}  [score={r['SCORE']:.1f}]  {strcolumnid}={r[strcolumnid]}")
+                print(
+                    f"  {i:2d}. {r[strcolumndesc]}  "
+                    f"[score={r['SCORE']:.1f}]  "
+                    f"{strcolumnpopularity}={r.get(strcolumnpopularity)}"
+                )
             print("")
 
         print(f"Search duration: {search_duration:.4f} seconds\n")
