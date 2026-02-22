@@ -23,6 +23,7 @@ Recommended DB schema additions (once):
 import os
 import re
 import sys
+import time
 from typing import List, Dict, Tuple, Any, Optional
 
 try:
@@ -47,6 +48,10 @@ LIKE_LIMIT = 20000       # last resort fallback
 MIN_CANDIDATES_OK = 200  # if prefix yields >= this, skip fallbacks
 
 TABLE = "T_WC_T2S_PERSON"
+COL_ID_PERSON = "ID_PERSON"
+COL_PERSON_NAME = "PERSON_NAME"
+COL_PERSON_NAME_NORM = "PERSON_NAME_NORM"
+COL_PERSON_NAME_KEY = "PERSON_NAME_KEY"
 
 # Environment variables (recommended)
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
@@ -54,6 +59,8 @@ DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASS", "")
 DB_NAME = os.getenv("DB_NAME", "")
+
+TIMINGS = os.getenv("TIMINGS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # ----------------------------
 # Normalization (should match your generated columns logic)
@@ -143,7 +150,12 @@ def get_db_connection():
         cursorclass=pymysql.cursors.DictCursor,
     )
 
-def db_has_norm_columns(cur) -> bool:
+def db_has_norm_columns(
+    cur,
+    strtablename: str,
+    strcolumndescnorm: str,
+    strcolumndesckey: str,
+) -> bool:
     """Check if required generated columns exist on the target table.
 
     Args:
@@ -158,12 +170,16 @@ def db_has_norm_columns(cur) -> bool:
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = DATABASE()
           AND TABLE_NAME = %s
-          AND COLUMN_NAME IN ('PERSON_NAME_NORM', 'PERSON_NAME_KEY')
-    """, (TABLE,))
+          AND COLUMN_NAME IN (%s, %s)
+    """, (strtablename, strcolumndescnorm, strcolumndesckey))
     row = cur.fetchone()
     return row["cnt"] == 2
 
-def db_has_fulltext(cur) -> bool:
+def db_has_fulltext(
+    cur,
+    strtablename: str,
+    strcolumndescnorm: str,
+) -> bool:
     """Check whether a FULLTEXT index exists on `PERSON_NAME_NORM`.
 
     Args:
@@ -173,13 +189,20 @@ def db_has_fulltext(cur) -> bool:
         True if a FULLTEXT index is found, otherwise False.
     """
     # crude check: whether any FULLTEXT index exists on PERSON_NAME_NORM
-    cur.execute(f"""
-        SHOW INDEX FROM {TABLE}
-        WHERE Index_type='FULLTEXT' AND Column_name='PERSON_NAME_NORM'
-    """)
+    cur.execute(
+        f"SHOW INDEX FROM `{strtablename}` WHERE Index_type='FULLTEXT' AND Column_name=%s",
+        (strcolumndescnorm,),
+    )
     return cur.fetchone() is not None
 
-def exact_match(cur, q_norm: str) -> Optional[Dict[str, Any]]:
+def exact_match(
+    cur,
+    strtablename: str,
+    strcolumnid: str,
+    strcolumndesc: str,
+    strcolumndescnorm: str,
+    q_norm: str,
+) -> Optional[Dict[str, Any]]:
     """Find an exact normalized match in the database.
 
     Args:
@@ -190,19 +213,32 @@ def exact_match(cur, q_norm: str) -> Optional[Dict[str, Any]]:
         A row dict if found, else None.
     """
     # Exact match on normalized form (fast with index on PERSON_NAME_NORM)
-    cur.execute(f"""
-        SELECT ID_PERSON, PERSON_NAME, PERSON_NAME_NORM
-        FROM {TABLE}
-        WHERE PERSON_NAME_NORM = %s
-          AND (DELETED IS NULL OR DELETED = 0)
+    cur.execute(
+        f"""
+        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+        FROM `{strtablename}`
+        WHERE `{strcolumndescnorm}` = %s
         LIMIT 1
-    """, (q_norm,))
+        """,
+        (q_norm,),
+    )
     row = cur.fetchone()
     if not row:
         return None
     return row
 
-def fetch_candidates(cur, q_norm: str, q_key: str, has_fulltext: bool) -> List[Tuple[int, str, str]]:
+def fetch_candidates(
+    cur,
+    strtablename: str,
+    strcolumnid: str,
+    strcolumndesc: str,
+    strcolumndescnorm: str,
+    strcolumndesckey: str,
+    q_norm: str,
+    q_key: str,
+    has_fulltext: bool,
+    timings: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[int, str, str]]:
     """Fetch candidate rows that may match the query.
 
     Strategy:
@@ -215,6 +251,7 @@ def fetch_candidates(cur, q_norm: str, q_key: str, has_fulltext: bool) -> List[T
         q_norm: Normalized query string.
         q_key: Key form of query (normalized without spaces).
         has_fulltext: Whether FULLTEXT is available on `PERSON_NAME_NORM`.
+        timings: Optional dict to store timing measurements.
 
     Returns:
         A list of row dicts with at least `ID_PERSON`, `PERSON_NAME`, `PERSON_NAME_NORM`.
@@ -223,57 +260,88 @@ def fetch_candidates(cur, q_norm: str, q_key: str, has_fulltext: bool) -> List[T
     prefix_len = 6 if len(q_key) >= 6 else max(3, len(q_key))
     prefix = q_key[:prefix_len]
 
-    cur.execute(f"""
-        SELECT ID_PERSON, PERSON_NAME, PERSON_NAME_NORM
-        FROM {TABLE}
-        WHERE PERSON_NAME_KEY LIKE CONCAT(%s, '%%')
-          AND (DELETED IS NULL OR DELETED = 0)
+    t0 = time.perf_counter() if timings is not None else 0.0
+    cur.execute(
+        f"""
+        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+        FROM `{strtablename}`
+        WHERE `{strcolumndesckey}` LIKE CONCAT(%s, '%%')
         LIMIT %s
-    """, (prefix, PREFIX_LIMIT))
+        """,
+        (prefix, PREFIX_LIMIT),
+    )
     rows = cur.fetchall() or []
+    if timings is not None:
+        timings["prefix_s"] = time.perf_counter() - t0
+        timings["prefix_n"] = len(rows)
     if len(rows) >= MIN_CANDIDATES_OK:
+        if timings is not None:
+            timings["used"] = "prefix"
         return rows
 
     # 2) FULLTEXT fallback (recommended)
     tokens = [t for t in q_norm.split() if t]
     tokens = sorted(tokens, key=len, reverse=True)[:3]  # longest tokens first
     if has_fulltext and tokens:
+        t1 = time.perf_counter() if timings is not None else 0.0
         ftx_query = build_boolean_query(tokens)
-        cur.execute(f"""
-            SELECT ID_PERSON, PERSON_NAME, PERSON_NAME_NORM
-            FROM {TABLE}
-            WHERE MATCH(PERSON_NAME_NORM) AGAINST (%s IN BOOLEAN MODE)
-              AND (DELETED IS NULL OR DELETED = 0)
+        cur.execute(
+            f"""
+            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+            FROM `{strtablename}`
+            WHERE MATCH(`{strcolumndescnorm}`) AGAINST (%s IN BOOLEAN MODE)
             LIMIT %s
-        """, (ftx_query, FTX_LIMIT))
+            """,
+            (ftx_query, FTX_LIMIT),
+        )
         rows2 = cur.fetchall() or []
+        if timings is not None:
+            timings["fulltext_s"] = time.perf_counter() - t1
+            timings["fulltext_n"] = len(rows2)
         if rows2:
-            seen = {r["ID_PERSON"] for r in rows}
-            rows.extend([r for r in rows2 if r["ID_PERSON"] not in seen])
+            seen = {r[strcolumnid] for r in rows}
+            rows.extend([r for r in rows2 if r[strcolumnid] not in seen])
             if len(rows) >= MIN_CANDIDATES_OK:
+                if timings is not None:
+                    timings["used"] = "fulltext"
                 return rows
 
     # 3) LIKE fallback (last resort)
     if tokens:
+        t2 = time.perf_counter() if timings is not None else 0.0
         t = tokens[0]
-        cur.execute(f"""
-            SELECT ID_PERSON, PERSON_NAME, PERSON_NAME_NORM
-            FROM {TABLE}
-            WHERE PERSON_NAME_NORM LIKE CONCAT('%%', %s, '%%')
-              AND (DELETED IS NULL OR DELETED = 0)
+        cur.execute(
+            f"""
+            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`
+            FROM `{strtablename}`
+            WHERE `{strcolumndescnorm}` LIKE CONCAT('%%', %s, '%%')
             LIMIT %s
-        """, (t, LIKE_LIMIT))
+            """,
+            (t, LIKE_LIMIT),
+        )
         rows3 = cur.fetchall() or []
+        if timings is not None:
+            timings["like_s"] = time.perf_counter() - t2
+            timings["like_n"] = len(rows3)
         if rows3:
-            seen = {r["ID_PERSON"] for r in rows}
-            rows.extend([r for r in rows3 if r["ID_PERSON"] not in seen])
+            seen = {r[strcolumnid] for r in rows}
+            rows.extend([r for r in rows3 if r[strcolumnid] not in seen])
+
+    if timings is not None and "used" not in timings:
+        timings["used"] = "like" if tokens else "prefix"
 
     return rows
 
 # ----------------------------
 # RapidFuzz decision logic
 # ----------------------------
-def rank_candidates(q_norm: str, candidates: List[Tuple[int, str, str]]) -> List[Dict[str, Any]]:
+def rank_candidates(
+    strcolumnid: str,
+    strcolumndesc: str,
+    strcolumndescnorm: str,
+    q_norm: str,
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """Rank candidate rows by lexical similarity using RapidFuzz.
 
     Args:
@@ -284,17 +352,17 @@ def rank_candidates(q_norm: str, candidates: List[Tuple[int, str, str]]) -> List
         A list of dicts containing the candidate fields plus a `SCORE` float.
     """
     # Dict choices: id -> norm for scoring
-    choices = {row["ID_PERSON"]: row["PERSON_NAME_NORM"] for row in candidates}
+    choices = {row[strcolumnid]: row[strcolumndescnorm] for row in candidates}
     matches = process.extract(q_norm, choices, scorer=fuzz.WRatio, limit=TOP_K)
 
-    id_to_row = {row["ID_PERSON"]: row for row in candidates}
+    id_to_row = {row[strcolumnid]: row for row in candidates}
     out = []
     for _match, score, pid in matches:
         r = id_to_row[pid]
         out.append({
-            "ID_PERSON": r["ID_PERSON"],
-            "PERSON_NAME": r["PERSON_NAME"],
-            "PERSON_NAME_NORM": r["PERSON_NAME_NORM"],
+            strcolumnid: r[strcolumnid],
+            strcolumndesc: r[strcolumndesc],
+            strcolumndescnorm: r[strcolumndescnorm],
             "SCORE": float(score),
         })
     return out
@@ -330,7 +398,13 @@ def main():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    if not db_has_norm_columns(cur):
+    strtablename = TABLE
+    strcolumnid = COL_ID_PERSON
+    strcolumndesc = COL_PERSON_NAME
+    strcolumndescnorm = COL_PERSON_NAME_NORM
+    strcolumndesckey = COL_PERSON_NAME_KEY
+
+    if not db_has_norm_columns(cur, strtablename, strcolumndescnorm, strcolumndesckey):
         print(
             "ERROR: Columns PERSON_NAME_NORM and PERSON_NAME_KEY are missing.\n"
             "Add them as STORED generated columns + index, then rerun.",
@@ -338,11 +412,11 @@ def main():
         )
         sys.exit(2)
 
-    has_fulltext = db_has_fulltext(cur)
+    has_fulltext = db_has_fulltext(cur, strtablename, strcolumndescnorm)
 
     print("Person name checker (RapidFuzz + MariaDB)")
     print(f"- DB: {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    print(f"- Table: {TABLE}")
+    print(f"- Table: {strtablename}")
     print(f"- FULLTEXT on PERSON_NAME_NORM: {'yes' if has_fulltext else 'no'}")
     print("Type 'quit' to exit.\n")
 
@@ -353,37 +427,80 @@ def main():
         if raw.lower() in ("quit", "exit", "q"):
             break
 
+        # Start timing the search operation
+        start_time = time.time()
         q_norm = normalize_name(raw)
         q_key = to_key(raw)
 
-        # 1) Exact match
-        hit = exact_match(cur, q_norm)
+        t_exact0 = time.perf_counter() if TIMINGS else 0.0
+        hit = exact_match(cur, strtablename, strcolumnid, strcolumndesc, strcolumndescnorm, q_norm)
+
+        t_exact1 = time.perf_counter() if TIMINGS else 0.0
         if hit:
-            print(f"✅ Valid name: {hit['PERSON_NAME']}  (ID_PERSON={hit['ID_PERSON']})\n")
+            print(f" Valid name: {hit[strcolumndesc]}  ({strcolumnid}={hit[strcolumnid]})\n")
+
+            if TIMINGS:
+                print(f"timings: exact_match={t_exact1 - t_exact0:.4f}s\n")
             continue
 
-        # 2) Candidates + rank
-        candidates = fetch_candidates(cur, q_norm, q_key, has_fulltext)
-        ranked = rank_candidates(q_norm, candidates)
+        fetch_t = {} if TIMINGS else None
+        t_fetch0 = time.perf_counter() if TIMINGS else 0.0
+        candidates = fetch_candidates(
+            cur,
+            strtablename,
+            strcolumnid,
+            strcolumndesc,
+            strcolumndescnorm,
+            strcolumndesckey,
+            q_norm,
+            q_key,
+            has_fulltext,
+            timings=fetch_t,
+        )
+
+        t_fetch1 = time.perf_counter() if TIMINGS else 0.0
+
+        t_rank0 = time.perf_counter() if TIMINGS else 0.0
+        ranked = rank_candidates(strcolumnid, strcolumndesc, strcolumndescnorm, q_norm, candidates)
+
+        t_rank1 = time.perf_counter() if TIMINGS else 0.0
 
         auto, best, reason = decide_autocorrect(ranked)
+        # End timing and calculate duration
+        end_time = time.time()
+        search_duration = end_time - start_time
         if not ranked:
-            print("❌ No candidates found.\n")
+            print(" No candidates found.\n")
             continue
 
         if auto and best:
-            print(f"✏️  Auto-corrected ({reason}):")
+            print(f"  Auto-corrected ({reason}):")
             print(f"    Input : {raw}")
-            print(f"    Fixed : {best['PERSON_NAME']}  (ID_PERSON={best['ID_PERSON']})\n")
+            print(f"    Fixed : {best[strcolumndesc]}  ({strcolumnid}={best[strcolumnid]})\n")
         else:
-            print(f"⚠️  Not confident to auto-correct ({reason}). Top suggestions:")
+            print(f"  Not confident to auto-correct ({reason}). Top suggestions:")
             for i, r in enumerate(ranked, 1):
-                print(f"  {i:2d}. {r['PERSON_NAME']}  [score={r['SCORE']:.1f}]  ID={r['ID_PERSON']}")
+                print(f"  {i:2d}. {r[strcolumndesc]}  [score={r['SCORE']:.1f}]  {strcolumnid}={r[strcolumnid]}")
             print("")
+
+        print(f"Search duration: {search_duration:.4f} seconds\n")
+        if TIMINGS:
+            prefix_s = fetch_t.get("prefix_s", 0.0)
+            fulltext_s = fetch_t.get("fulltext_s", 0.0)
+            like_s = fetch_t.get("like_s", 0.0)
+            print(
+                "timings: "
+                f"exact_match={t_exact1 - t_exact0:.4f}s "
+                f"fetch_total={t_fetch1 - t_fetch0:.4f}s "
+                f"rank={t_rank1 - t_rank0:.4f}s\n"
+                f"  candidates={len(candidates)} used={fetch_t.get('used')}\n"
+                f"  prefix={prefix_s:.4f}s n={fetch_t.get('prefix_n')}\n"
+                f"  fulltext={fulltext_s:.4f}s n={fetch_t.get('fulltext_n')}\n"
+                f"  like={like_s:.4f}s n={fetch_t.get('like_n')}\n"
+            )
 
     cur.close()
     conn.close()
 
 if __name__ == "__main__":
     main()
-    
