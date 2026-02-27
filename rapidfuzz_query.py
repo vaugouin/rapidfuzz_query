@@ -47,7 +47,7 @@ FTX_LIMIT = 20000        # candidates fetched for fulltext fallback
 LIKE_LIMIT = 20000       # last resort fallback
 MIN_CANDIDATES_OK = 200  # if prefix yields >= this, skip fallbacks
 
-TABLE = "T_WC_T2S_PERSON"
+PERSON_TABLE = "T_WC_T2S_PERSON"
 COL_ID_PERSON = "ID_PERSON"
 COL_PERSON_NAME = "PERSON_NAME"
 COL_PERSON_NAME_NORM = "PERSON_NAME_NORM"
@@ -402,6 +402,118 @@ def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dic
 
     return (False, top1, f"suggest(score={top1['SCORE']:.1f}, margin={margin:.1f})")
 
+def search_first_match(
+    cur,
+    strtablename: str,
+    strcolumnid: str,
+    strcolumndesc: str,
+    strcolumndescnorm: str,
+    strcolumndesckey: str,
+    strcolumnpopularity: str,
+    raw: str,
+    has_fulltext: bool,
+    timings_enabled: bool = False,
+) -> Dict[str, Any]:
+    """Search for a person name and return the best match.
+
+    This is designed to be imported and reused by other modules (e.g. a FastAPI
+    service). It does not print.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+        strtablename: Table name.
+        strcolumnid: Primary key column name.
+        strcolumndesc: Display column name (original name).
+        strcolumndescnorm: Normalized name column name.
+        strcolumndesckey: Key column name.
+        strcolumnpopularity: Popularity column name.
+        raw: Raw user input.
+        has_fulltext: Whether FULLTEXT is available.
+        timings_enabled: If True, return timing details.
+
+    Returns:
+        A dict with:
+            - hit: exact-match row or None
+            - ranked: ranked suggestions (possibly empty)
+            - auto: bool
+            - best: best suggestion row or None
+            - reason: reason string
+            - timings: dict of timing breakdown (may be empty)
+            - candidates_count: number of candidates fetched
+    """
+    q_norm = normalize_name(raw)
+    q_key = to_key(raw)
+
+    t_exact0 = time.perf_counter() if timings_enabled else 0.0
+    hit = exact_match(
+        cur,
+        strtablename,
+        strcolumnid,
+        strcolumndesc,
+        strcolumndescnorm,
+        strcolumnpopularity,
+        q_norm,
+    )
+    t_exact1 = time.perf_counter() if timings_enabled else 0.0
+    if hit:
+        return {
+            "hit": hit,
+            "ranked": [],
+            "auto": True,
+            "best": hit,
+            "reason": "exact",
+            "timings": {"exact_match": t_exact1 - t_exact0} if timings_enabled else {},
+            "candidates_count": 0,
+        }
+
+    fetch_t = {} if timings_enabled else None
+    t_fetch0 = time.perf_counter() if timings_enabled else 0.0
+    candidates = fetch_candidates(
+        cur,
+        strtablename,
+        strcolumnid,
+        strcolumndesc,
+        strcolumndescnorm,
+        strcolumndesckey,
+        strcolumnpopularity,
+        q_norm,
+        q_key,
+        has_fulltext,
+        timings=fetch_t,
+    )
+    t_fetch1 = time.perf_counter() if timings_enabled else 0.0
+
+    t_rank0 = time.perf_counter() if timings_enabled else 0.0
+    ranked = rank_candidates(
+        strcolumnid,
+        strcolumndesc,
+        strcolumndescnorm,
+        strcolumnpopularity,
+        q_norm,
+        candidates,
+    )
+    t_rank1 = time.perf_counter() if timings_enabled else 0.0
+
+    auto, _best, reason = decide_autocorrect(ranked)
+    best = ranked[0] if ranked else None
+
+    timings: Dict[str, Any] = {}
+    if timings_enabled:
+        timings["exact_match"] = t_exact1 - t_exact0
+        timings["fetch_total"] = t_fetch1 - t_fetch0
+        timings["rank"] = t_rank1 - t_rank0
+        timings["fetch_breakdown"] = fetch_t or {}
+
+    return {
+        "hit": None,
+        "ranked": ranked,
+        "auto": auto,
+        "best": best,
+        "reason": reason,
+        "timings": timings,
+        "candidates_count": len(candidates),
+    }
+
 # ----------------------------
 # Main interactive loop
 # ----------------------------
@@ -410,7 +522,7 @@ def main():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    strtablename = TABLE
+    strtablename = PERSON_TABLE
     strcolumnid = COL_ID_PERSON
     strcolumndesc = COL_PERSON_NAME
     strcolumndescnorm = COL_PERSON_NAME_NORM
@@ -440,33 +552,9 @@ def main():
         if raw.lower() in ("quit", "exit", "q"):
             break
 
-        # Start timing the search operation
         start_time = time.time()
-        q_norm = normalize_name(raw)
-        q_key = to_key(raw)
 
-        t_exact0 = time.perf_counter() if TIMINGS else 0.0
-        hit = exact_match(
-            cur,
-            strtablename,
-            strcolumnid,
-            strcolumndesc,
-            strcolumndescnorm,
-            strcolumnpopularity,
-            q_norm,
-        )
-
-        t_exact1 = time.perf_counter() if TIMINGS else 0.0
-        if hit:
-            print(f" Valid name: {hit[strcolumndesc]}  ({strcolumnid}={hit[strcolumnid]})\n")
-
-            if TIMINGS:
-                print(f"timings: exact_match={t_exact1 - t_exact0:.4f}s\n")
-            continue
-
-        fetch_t = {} if TIMINGS else None
-        t_fetch0 = time.perf_counter() if TIMINGS else 0.0
-        candidates = fetch_candidates(
+        result = search_first_match(
             cur,
             strtablename,
             strcolumnid,
@@ -474,30 +562,27 @@ def main():
             strcolumndescnorm,
             strcolumndesckey,
             strcolumnpopularity,
-            q_norm,
-            q_key,
+            raw,
             has_fulltext,
-            timings=fetch_t,
+            timings_enabled=TIMINGS,
         )
 
-        t_fetch1 = time.perf_counter() if TIMINGS else 0.0
-
-        t_rank0 = time.perf_counter() if TIMINGS else 0.0
-        ranked = rank_candidates(
-            strcolumnid,
-            strcolumndesc,
-            strcolumndescnorm,
-            strcolumnpopularity,
-            q_norm,
-            candidates,
-        )
-
-        t_rank1 = time.perf_counter() if TIMINGS else 0.0
-
-        auto, best, reason = decide_autocorrect(ranked)
-        # End timing and calculate duration
         end_time = time.time()
         search_duration = end_time - start_time
+
+        if result["hit"] is not None:
+            hit = result["hit"]
+            print(f" Valid name: {hit[strcolumndesc]}  ({strcolumnid}={hit[strcolumnid]})\n")
+            print(f"Search duration: {search_duration:.4f} seconds\n")
+            if TIMINGS:
+                print(f"timings: exact_match={result['timings'].get('exact_match', 0.0):.4f}s\n")
+            continue
+
+        ranked = result["ranked"]
+        auto = result["auto"]
+        best = result["best"]
+        reason = result["reason"]
+
         if not ranked:
             print(" No candidates found.\n")
             continue
@@ -508,6 +593,8 @@ def main():
             print(f"    Fixed : {best[strcolumndesc]}  ({strcolumnid}={best[strcolumnid]})\n")
         else:
             print(f"  Not confident to auto-correct ({reason}). Top suggestions:")
+            if best is not None:
+                print(f"    Best : {best[strcolumndesc]}  [score={best['SCORE']:.1f}]  {strcolumnpopularity}={best.get(strcolumnpopularity)}")
             for i, r in enumerate(ranked, 1):
                 print(
                     f"  {i:2d}. {r[strcolumndesc]}  "
@@ -518,15 +605,16 @@ def main():
 
         print(f"Search duration: {search_duration:.4f} seconds\n")
         if TIMINGS:
+            fetch_t = result["timings"].get("fetch_breakdown", {})
             prefix_s = fetch_t.get("prefix_s", 0.0)
             fulltext_s = fetch_t.get("fulltext_s", 0.0)
             like_s = fetch_t.get("like_s", 0.0)
             print(
                 "timings: "
-                f"exact_match={t_exact1 - t_exact0:.4f}s "
-                f"fetch_total={t_fetch1 - t_fetch0:.4f}s "
-                f"rank={t_rank1 - t_rank0:.4f}s\n"
-                f"  candidates={len(candidates)} used={fetch_t.get('used')}\n"
+                f"exact_match={result['timings'].get('exact_match', 0.0):.4f}s "
+                f"fetch_total={result['timings'].get('fetch_total', 0.0):.4f}s "
+                f"rank={result['timings'].get('rank', 0.0):.4f}s\n"
+                f"  candidates={result.get('candidates_count')} used={fetch_t.get('used')}\n"
                 f"  prefix={prefix_s:.4f}s n={fetch_t.get('prefix_n')}\n"
                 f"  fulltext={fulltext_s:.4f}s n={fetch_t.get('fulltext_n')}\n"
                 f"  like={like_s:.4f}s n={fetch_t.get('like_n')}\n"
