@@ -47,13 +47,6 @@ FTX_LIMIT = 20000        # candidates fetched for fulltext fallback
 LIKE_LIMIT = 20000       # last resort fallback
 MIN_CANDIDATES_OK = 200  # if prefix yields >= this, skip fallbacks
 
-PERSON_TABLE = "T_WC_T2S_PERSON"
-COL_ID_PERSON = "ID_PERSON"
-COL_PERSON_NAME = "PERSON_NAME"
-COL_PERSON_NAME_NORM = "PERSON_NAME_NORM"
-COL_PERSON_NAME_KEY = "PERSON_NAME_KEY"
-COL_POPULARITY = "POPULARITY"
-
 # Environment variables (recommended)
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
@@ -66,7 +59,6 @@ TIMINGS = os.getenv("TIMINGS", "0").strip().lower() in {"1", "true", "yes", "on"
 # ----------------------------
 # Normalization (should match your generated columns logic)
 # ----------------------------
-_rx_non_alnum_space = re.compile(r"[^0-9a-zA-ZÀ-ÿ ]+")
 _rx_spaces = re.compile(r"\s+")
 
 def normalize_name(s: str) -> str:
@@ -81,10 +73,22 @@ def normalize_name(s: str) -> str:
     Returns:
         Normalized string.
     """
-    s = (s or "").strip().lower()
-    s = _rx_non_alnum_space.sub(" ", s)
-    s = _rx_spaces.sub(" ", s).strip()
-    return s
+    s = (s or "").strip()
+    if not s:
+        return ""
+
+    out_chars = []
+    for ch in s:
+        if ch.isalnum():
+            out_chars.append(ch.lower())
+        elif ch.isspace():
+            out_chars.append(" ")
+        else:
+            out_chars.append(" ")
+
+    s_norm = "".join(out_chars)
+    s_norm = _rx_spaces.sub(" ", s_norm).strip()
+    return s_norm
 
 def to_key(s: str) -> str:
     """Build a compact key version of a name for prefix lookups.
@@ -442,6 +446,17 @@ def search_first_match(
             - candidates_count: number of candidates fetched
     """
     q_norm = normalize_name(raw)
+    if not q_norm:
+        return {
+            "hit": None,
+            "ranked": [],
+            "auto": False,
+            "best": None,
+            "reason": "empty_query",
+            "timings": {},
+            "candidates_count": 0,
+        }
+
     q_key = to_key(raw)
 
     t_exact0 = time.perf_counter() if timings_enabled else 0.0
@@ -514,6 +529,158 @@ def search_first_match(
         "candidates_count": len(candidates),
     }
 
+def db_lookup_by_id(
+    cur,
+    strtablename: str,
+    strkeycolumn: str,
+    strkeyvalue: Any,
+    select_columns: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Lookup a single row by ID and return selected columns.
+
+    Args:
+        cur: A DB cursor (DictCursor).
+        strtablename: Table name.
+        strkeycolumn: Key column name.
+        strkeyvalue: Key value.
+        select_columns: Columns to select.
+
+    Returns:
+        Row dict or None.
+    """
+    cols_sql = ", ".join(f"`{c}`" for c in select_columns)
+    cur.execute(
+        f"SELECT {cols_sql} FROM `{strtablename}` WHERE `{strkeycolumn}` = %s LIMIT 1",
+        (strkeyvalue,),
+    )
+    return cur.fetchone()
+
+def build_match_object(
+    *,
+    source: str,
+    table: str,
+    id_col: str,
+    text_col: str,
+    norm_col: str,
+    row: Dict[str, Any],
+    score: Optional[float] = None,
+    enriched: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a normalized match object for output."""
+    out: Dict[str, Any] = {
+        "source": source,
+        "table": table,
+        "id": row.get(id_col),
+        "text": row.get(text_col),
+        "norm": row.get(norm_col),
+        "fields": row,
+        "enriched": enriched or {},
+    }
+    if score is not None:
+        out["score"] = float(score)
+    return out
+
+def enrich_match_object(cur, match: Dict[str, Any], enrich_config: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Enrich a match object using config-driven lookups."""
+    if not enrich_config:
+        return match
+
+    enriched: Dict[str, Any] = dict(match.get("enriched") or {})
+    fields = match.get("fields") or {}
+    for step in enrich_config:
+        from_key = step.get("from_key")
+        attach_as = step.get("attach_as")
+        lookup = step.get("lookup") or {}
+        if not from_key or not attach_as:
+            continue
+
+        key_val = fields.get(from_key)
+        if key_val is None:
+            continue
+
+        row = db_lookup_by_id(
+            cur,
+            lookup.get("table"),
+            lookup.get("key_col"),
+            key_val,
+            lookup.get("select_cols") or [],
+        )
+        if row is not None:
+            enriched[attach_as] = row
+
+    match["enriched"] = enriched
+    return match
+
+def search_first_match_configured(
+    *,
+    cur,
+    cmd: str,
+    config: Dict[str, Any],
+    raw: str,
+    timings_enabled: bool = False,
+) -> Dict[str, Any]:
+    """Config-driven search returning structured match objects (with optional enrichment)."""
+    search_cfg = config.get("search") or {}
+    enrich_cfg = config.get("enrich") or []
+    enrich_mode = config.get("enrich_mode", "best_only")
+
+    state_has_fulltext = bool(search_cfg.get("has_fulltext"))
+    base = search_first_match(
+        cur,
+        search_cfg["table"],
+        search_cfg["id"],
+        search_cfg["desc"],
+        search_cfg["norm"],
+        search_cfg["key"],
+        search_cfg["pop"],
+        raw,
+        state_has_fulltext,
+        timings_enabled=timings_enabled,
+    )
+
+    def _wrap_row(row: Optional[Dict[str, Any]], score: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        m = build_match_object(
+            source=cmd,
+            table=search_cfg["table"],
+            id_col=search_cfg["id"],
+            text_col=search_cfg["desc"],
+            norm_col=search_cfg["norm"],
+            row=row,
+            score=score,
+        )
+        return m
+
+    hit_match = _wrap_row(base.get("hit"))
+    ranked_matches: List[Dict[str, Any]] = []
+    for r in base.get("ranked") or []:
+        ranked_matches.append(_wrap_row(r, score=r.get("SCORE")))
+
+    best_match = _wrap_row(base.get("best"), score=(base.get("best") or {}).get("SCORE") if base.get("best") else None)
+
+    if enrich_mode == "best_only":
+        if hit_match is not None:
+            hit_match = enrich_match_object(cur, hit_match, enrich_cfg)
+        if best_match is not None:
+            best_match = enrich_match_object(cur, best_match, enrich_cfg)
+    elif enrich_mode == "all_ranked":
+        if hit_match is not None:
+            hit_match = enrich_match_object(cur, hit_match, enrich_cfg)
+        if best_match is not None:
+            best_match = enrich_match_object(cur, best_match, enrich_cfg)
+        ranked_matches = [enrich_match_object(cur, m, enrich_cfg) for m in ranked_matches]
+
+    return {
+        "hit": hit_match,
+        "ranked": ranked_matches,
+        "auto": base.get("auto"),
+        "best": best_match,
+        "reason": base.get("reason"),
+        "timings": base.get("timings"),
+        "candidates_count": base.get("candidates_count"),
+    }
+
 # ----------------------------
 # Main interactive loop
 # ----------------------------
@@ -522,48 +689,115 @@ def main():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    strtablename = PERSON_TABLE
-    strcolumnid = COL_ID_PERSON
-    strcolumndesc = COL_PERSON_NAME
-    strcolumndescnorm = COL_PERSON_NAME_NORM
-    strcolumndesckey = COL_PERSON_NAME_KEY
-    strcolumnpopularity = COL_POPULARITY
+    configs = {
+        "person": {
+            "search": {
+                "table": "T_WC_T2S_PERSON",
+                "id": "ID_PERSON",
+                "desc": "PERSON_NAME",
+                "norm": "PERSON_NAME_NORM",
+                "key": "PERSON_NAME_KEY",
+                "pop": "POPULARITY",
+            },
+            "enrich": [],
+            "enrich_mode": "best_only",
+        },
+        "aka": {
+            "search": {
+                "table": "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+                "id": "ID_ROW",
+                "desc": "PERSON_NAME",
+                "norm": "PERSON_NAME_NORM",
+                "key": "PERSON_NAME_KEY",
+                "pop": "ID_PERSON",
+            },
+            "enrich": [
+                {
+                    "from_key": "ID_PERSON",
+                    "attach_as": "person",
+                    "lookup": {
+                        "table": "T_WC_T2S_PERSON",
+                        "key_col": "ID_PERSON",
+                        "select_cols": ["ID_PERSON", "PERSON_NAME"],
+                    },
+                }
+            ],
+            "enrich_mode": "best_only",
+        },
+    }
 
-    if not db_has_norm_columns(cur, strtablename, strcolumndescnorm, strcolumndesckey):
-        print(
-            "ERROR: Columns PERSON_NAME_NORM and PERSON_NAME_KEY are missing.\n"
-            "Add them as STORED generated columns + index, then rerun.",
-            file=sys.stderr
-        )
-        sys.exit(2)
+    table_state: Dict[str, Dict[str, Any]] = {}
 
-    has_fulltext = db_has_fulltext(cur, strtablename, strcolumndescnorm)
+    def ensure_table_ready(cmd: str) -> Dict[str, Any]:
+        if cmd in table_state:
+            return table_state[cmd]
+
+        search_cfg = configs[cmd]["search"]
+        if not db_has_norm_columns(cur, search_cfg["table"], search_cfg["norm"], search_cfg["key"]):
+            print(
+                f"ERROR: Columns {search_cfg['norm']} and {search_cfg['key']} are missing on table {search_cfg['table']}.\n"
+                "Add them as STORED generated columns + index, then rerun.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        has_fulltext = db_has_fulltext(cur, search_cfg["table"], search_cfg["norm"])
+        state = {"has_fulltext": has_fulltext}
+        table_state[cmd] = state
+        search_cfg["has_fulltext"] = has_fulltext
+        return state
+
+    current_cmd = "person"
+    ensure_table_ready(current_cmd)
 
     print("Person name checker (RapidFuzz + MariaDB)")
     print(f"- DB: {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    print(f"- Table: {strtablename}")
-    print(f"- FULLTEXT on PERSON_NAME_NORM: {'yes' if has_fulltext else 'no'}")
+    print("Commands:")
+    print("  person <person_name>")
+    print("  aka <person_name>")
+    print("(If you omit the command, the previous command is reused.)")
     print("Type 'quit' to exit.\n")
 
     while True:
-        raw = input("Enter a person name: ").strip()
+        raw = input("Enter your command (e.g. 'person <name>'): ").strip()
         if not raw:
             continue
         if raw.lower() in ("quit", "exit", "q"):
             break
 
+        words = raw.split()
+        if not words:
+            continue
+
+        cmd = words[0].lower()
+        if cmd == "help":
+            print("\nCommands:")
+            print("  person <person_name>")
+            print("  aka <person_name>")
+            print("  help")
+            print("  quit / exit / q\n")
+            continue
+
+        if cmd in configs:
+            current_cmd = cmd
+            query = " ".join(words[1:]).strip()
+            if not query:
+                print(f" Current search set to '{current_cmd}'.\n")
+                continue
+        else:
+            query = raw
+            cmd = current_cmd
+
+        cfg = configs[cmd]
+        ensure_table_ready(cmd)
+
         start_time = time.time()
 
-        result = search_first_match(
-            cur,
-            strtablename,
-            strcolumnid,
-            strcolumndesc,
-            strcolumndescnorm,
-            strcolumndesckey,
-            strcolumnpopularity,
-            raw,
-            has_fulltext,
+        result = search_first_match_configured(
+            cur=cur,
+            cmd=cmd,
+            config=cfg,
+            raw=query,
             timings_enabled=TIMINGS,
         )
 
@@ -572,7 +806,18 @@ def main():
 
         if result["hit"] is not None:
             hit = result["hit"]
-            print(f" Valid name: {hit[strcolumndesc]}  ({strcolumnid}={hit[strcolumnid]})\n")
+            hit_fields = hit.get("fields") or {}
+            id_label = configs[cmd]["search"]["id"]
+            text_label = configs[cmd]["search"]["desc"]
+            print(f" Valid name: {hit.get('text')}  ({id_label}={hit.get('id')})")
+            if cmd == "aka":
+                if "ID_PERSON" in hit_fields:
+                    print(f" ID_PERSON={hit_fields.get('ID_PERSON')}")
+                person = (hit.get("enriched") or {}).get("person")
+                if person and person.get("PERSON_NAME") is not None:
+                    print(f" PERSON_NAME (English)={person.get('PERSON_NAME')}")
+            print("")
+            print("")
             print(f"Search duration: {search_duration:.4f} seconds\n")
             if TIMINGS:
                 print(f"timings: exact_match={result['timings'].get('exact_match', 0.0):.4f}s\n")
@@ -589,17 +834,36 @@ def main():
 
         if auto and best:
             print(f"  Auto-corrected ({reason}):")
-            print(f"    Input : {raw}")
-            print(f"    Fixed : {best[strcolumndesc]}  ({strcolumnid}={best[strcolumnid]})\n")
+            print(f"    Input : {query}")
+            id_label = configs[cmd]["search"]["id"]
+            print(f"    Fixed : {best.get('text')}  ({id_label}={best.get('id')})")
+            if cmd == "aka":
+                best_fields = best.get("fields") or {}
+                if "ID_PERSON" in best_fields:
+                    print(f" ID_PERSON={best_fields.get('ID_PERSON')}")
+                person = (best.get("enriched") or {}).get("person")
+                if person and person.get("PERSON_NAME") is not None:
+                    print(f" PERSON_NAME (English)={person.get('PERSON_NAME')}")
+            print("\n")
         else:
             print(f"  Not confident to auto-correct ({reason}). Top suggestions:")
             if best is not None:
-                print(f"    Best : {best[strcolumndesc]}  [score={best['SCORE']:.1f}]  {strcolumnpopularity}={best.get(strcolumnpopularity)}")
-            for i, r in enumerate(ranked, 1):
+                best_fields = best.get("fields") or {}
+                pop_label = configs[cmd]["search"]["pop"]
+                score = best.get("score")
                 print(
-                    f"  {i:2d}. {r[strcolumndesc]}  "
-                    f"[score={r['SCORE']:.1f}]  "
-                    f"{strcolumnpopularity}={r.get(strcolumnpopularity)}"
+                    f"    Best : {best.get('text')}  "
+                    f"[score={score:.1f}]  "
+                    f"{pop_label}={best_fields.get(pop_label)}"
+                )
+            for i, r in enumerate(ranked, 1):
+                r_fields = r.get("fields") or {}
+                pop_label = configs[cmd]["search"]["pop"]
+                score = r.get("score")
+                print(
+                    f"  {i:2d}. {r.get('text')}  "
+                    f"[score={score:.1f}]  "
+                    f"{pop_label}={r_fields.get(pop_label)}"
                 )
             print("")
 
