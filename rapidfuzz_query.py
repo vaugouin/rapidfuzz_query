@@ -639,6 +639,7 @@ def search_first_match_configured(
     )
 
     def _wrap_row(row: Optional[Dict[str, Any]], score: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Wrap a raw database row in the normalized match-object structure."""
         if row is None:
             return None
         m = build_match_object(
@@ -729,6 +730,7 @@ def main():
     table_state: Dict[str, Dict[str, Any]] = {}
 
     def ensure_table_ready(cmd: str) -> Dict[str, Any]:
+        """Cache per-table search capabilities before running an interactive lookup."""
         if cmd in table_state:
             return table_state[cmd]
 
