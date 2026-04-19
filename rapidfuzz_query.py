@@ -35,6 +35,10 @@ except ImportError:
 
 import pymysql
 from rapidfuzz import process, fuzz
+from rapidfuzz.distance import Levenshtein
+
+def levenshtein_distance(a: str, b: str) -> int:
+    return int(Levenshtein.distance(a or "", b or ""))
 
 # ----------------------------
 # Config (tune as needed)
@@ -811,7 +815,12 @@ def main():
             hit_fields = hit.get("fields") or {}
             id_label = configs[cmd]["search"]["id"]
             text_label = configs[cmd]["search"]["desc"]
-            print(f" Valid name: {hit.get('text')}  ({id_label}={hit.get('id')})")
+            hit_dist = levenshtein_distance(query, hit.get("text") or "")
+            print(
+                f" Valid name: {hit.get('text')}  "
+                f"({id_label}={hit.get('id')})  "
+                f"[Levenshtein={hit_dist}]"
+            )
             if cmd == "aka":
                 if "ID_PERSON" in hit_fields:
                     print(f" ID_PERSON={hit_fields.get('ID_PERSON')}")
@@ -825,46 +834,50 @@ def main():
                 print(f"timings: exact_match={result['timings'].get('exact_match', 0.0):.4f}s\n")
             continue
 
-        ranked = result["ranked"]
-        auto = result["auto"]
-        best = result["best"]
-        reason = result["reason"]
-
-        if not ranked:
+        if not result["ranked"]:
             print(" No candidates found.\n")
             continue
 
-        if auto and best:
-            print(f"  Auto-corrected ({reason}):")
+        if result["auto"] and result["best"]:
+            print(f"  Auto-corrected ({result['reason']}):")
             print(f"    Input : {query}")
             id_label = configs[cmd]["search"]["id"]
-            print(f"    Fixed : {best.get('text')}  ({id_label}={best.get('id')})")
+            best_dist = levenshtein_distance(query, result["best"].get("text") or "")
+            print(
+                f"    Fixed : {result['best'].get('text')}  "
+                f"({id_label}={result['best'].get('id')})  "
+                f"[Levenshtein={best_dist}]"
+            )
             if cmd == "aka":
-                best_fields = best.get("fields") or {}
+                best_fields = result["best"].get("fields") or {}
                 if "ID_PERSON" in best_fields:
                     print(f" ID_PERSON={best_fields.get('ID_PERSON')}")
-                person = (best.get("enriched") or {}).get("person")
+                person = (result["best"].get("enriched") or {}).get("person")
                 if person and person.get("PERSON_NAME") is not None:
                     print(f" PERSON_NAME (English)={person.get('PERSON_NAME')}")
             print("\n")
         else:
-            print(f"  Not confident to auto-correct ({reason}). Top suggestions:")
-            if best is not None:
-                best_fields = best.get("fields") or {}
+            print(f"  Not confident to auto-correct ({result['reason']}). Top suggestions:")
+            if result["best"] is not None:
+                best_fields = result["best"].get("fields") or {}
                 pop_label = configs[cmd]["search"]["pop"]
-                score = best.get("score")
+                score = result["best"].get("score")
+                best_dist = levenshtein_distance(query, result["best"].get("text") or "")
                 print(
-                    f"    Best : {best.get('text')}  "
+                    f"    Best : {result['best'].get('text')}  "
                     f"[score={score:.1f}]  "
+                    f"[Levenshtein={best_dist}]  "
                     f"{pop_label}={best_fields.get(pop_label)}"
                 )
-            for i, r in enumerate(ranked, 1):
+            for i, r in enumerate(result["ranked"], 1):
                 r_fields = r.get("fields") or {}
                 pop_label = configs[cmd]["search"]["pop"]
                 score = r.get("score")
+                r_dist = levenshtein_distance(query, r.get("text") or "")
                 print(
                     f"  {i:2d}. {r.get('text')}  "
                     f"[score={score:.1f}]  "
+                    f"[Levenshtein={r_dist}]  "
                     f"{pop_label}={r_fields.get(pop_label)}"
                 )
             print("")
