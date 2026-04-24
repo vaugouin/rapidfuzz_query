@@ -91,6 +91,12 @@ Candidate retrieval is performed by `fetch_candidates()` using multiple strategi
   - Query: `PERSON_NAME_KEY LIKE '<prefix>%'`
   - Intended to use an index on `PERSON_NAME_KEY`
 
+- **BK-tree strategy (optional, recommended)**
+  - Runs when a pre-built `BKTreeIndex` is passed in
+  - Returns Levenshtein neighbours regardless of where the typo sits
+  - Covers cases the prefix strategy cannot (typos in the first characters)
+  - See "BK-tree fuzzy index" below
+
 - **FULLTEXT strategy (fallback, recommended)**
   - Query: `MATCH(PERSON_NAME_NORM) AGAINST (... IN BOOLEAN MODE)`
   - Requires a FULLTEXT index on the normalized column
@@ -103,6 +109,133 @@ Candidate retrieval is performed by `fetch_candidates()` using multiple strategi
 
 - **`build_boolean_query(tokens)`** builds a boolean-mode query string.
   - Tokens of length >= 4 get a trailing `*` for prefix matching.
+
+---
+
+## 2.bis) BK-tree fuzzy index (typos in first characters)
+
+The prefix / FULLTEXT / LIKE pools all pivot on the start of the string or the
+start of a word. When a typo lands inside the first few characters (`RICARDO`
+vs `RICCARDO`, `HILLARY` vs `HILARY`, `KATHERINE` vs `KATHARINE`), those
+pools miss the correct row even though the Levenshtein distance is only 1.
+
+The `BKTreeIndex` class fixes this. It is an in-memory
+[BK-tree](https://en.wikipedia.org/wiki/BK-tree) keyed on Levenshtein distance
+over the normalized name column. Any row within a small edit distance of the
+query is returned in sub-millisecond time regardless of where the typo sits.
+
+### Key properties
+
+- **Additive**: when supplied, the BK-tree pool always runs and its rows are
+  unioned with the prefix pool. Behavior when it is absent is bit-identical
+  to the legacy pipeline — fully backward-compatible.
+- **No schema change**: it reads `(id, norm_name)` pairs from the existing
+  normalized column. Indexes already recommended for prefix lookup are enough.
+- **No new dependency**: uses `rapidfuzz.distance.Levenshtein.distance`.
+
+### Adaptive max distance
+
+`choose_bktree_k(q_norm)` picks the search radius based on the query length:
+
+| Normalized length        | Max Levenshtein distance |
+|--------------------------|-------------------------:|
+| `<= BKTREE_LEN_SHORT`  (6)  | `BKTREE_K_SHORT`  (1) |
+| `<= BKTREE_LEN_LONG`  (14)  | `BKTREE_K_MEDIUM` (2) |
+| longer                   | `BKTREE_K_LONG`   (3) |
+
+All four length/k constants are module-level and can be overridden from the
+calling project before the first search.
+
+### Public API
+
+- `BKTreeIndex()` — empty tree.
+- `BKTreeIndex.insert(item_id, norm_name)` — add one entry.
+- `BKTreeIndex.build_from_cursor(cur, table, id_col, norm_col, batch_size=50_000)`
+  — stream rows from the DB and build in one pass.
+- `BKTreeIndex.query(q_norm, max_distance) -> List[Tuple[id, norm, distance]]`
+  — return all entries within `max_distance`.
+- `BKTreeIndex.size` — total indexed entries.
+- `build_bktree_for_config(cur, search_cfg) -> BKTreeIndex` — convenience
+  factory that takes the same `search_cfg` shape used by
+  `search_first_match_configured()`.
+
+### Concurrency
+
+Queries are safe from multiple threads once the tree is fully built. Inserts
+are NOT thread-safe — build first, query later. If the underlying table
+changes, rebuild (e.g. nightly) or use `insert()` under an external lock.
+
+### Cost
+
+- **RAM**: roughly 50–100 MB per 1 M names (varies with average name length).
+- **Build time**: ~1–3 minutes per 1 M rows on typical hardware.
+- **Per-query**: sub-millisecond for `k <= 3` on realistic dictionaries.
+
+### Integration patterns
+
+Two ways to wire it into a downstream project:
+
+1. **Pass through the flat API**
+   ```python
+   import rapidfuzz_query as rq
+
+   idx = rq.BKTreeIndex()
+   idx.build_from_cursor(cur, "T_WC_T2S_PERSON", "ID_PERSON", "PERSON_NAME_NORM")
+
+   result = rq.search_first_match(
+       cur,
+       "T_WC_T2S_PERSON",
+       "ID_PERSON",
+       "PERSON_NAME",
+       "PERSON_NAME_NORM",
+       "PERSON_NAME_KEY",
+       "POPULARITY",
+       raw="RICARDO FREDA",
+       has_fulltext=has_fulltext,
+       bktree=idx,
+   )
+   ```
+
+2. **Via the configured API** (preferred for multi-table apps)
+
+   Put the `BKTreeIndex` under the `bktree` key of your `search` config:
+   ```python
+   cfg = {
+       "search": {
+           "table": "T_WC_T2S_PERSON",
+           "id": "ID_PERSON",
+           "desc": "PERSON_NAME",
+           "norm": "PERSON_NAME_NORM",
+           "key": "PERSON_NAME_KEY",
+           "pop": "POPULARITY",
+           "has_fulltext": has_fulltext,
+           "bktree": rq.build_bktree_for_config(cur, {
+               "table": "T_WC_T2S_PERSON",
+               "id": "ID_PERSON",
+               "norm": "PERSON_NAME_NORM",
+           }),
+       },
+       "enrich": [],
+       "enrich_mode": "best_only",
+   }
+
+   result = rq.search_first_match_configured(
+       cur=cur, cmd="person", config=cfg, raw="HILLARY SWANK"
+   )
+   ```
+
+If the `bktree` key is absent (or its value is not a `BKTreeIndex`),
+`search_first_match_configured()` silently falls back to the legacy pipeline
+— no change for existing consumers.
+
+### CLI
+
+In CLI mode the index is built once per table, on first use, by
+`ensure_table_ready()`. Set `BKTREE_ENABLED=0` to disable it (useful when
+RAM / startup cost matters). With `TIMINGS=1` the per-query breakdown now
+includes a `bktree=...` line with the raw hit count, the adaptive `k`, and
+how many new IDs the pool contributed after deduplication against the prefix
+pool.
 
 ---
 
@@ -285,6 +418,9 @@ At the top of the file:
 - `FTX_LIMIT`
 - `LIKE_LIMIT`
 - `MIN_CANDIDATES_OK`
+- `BKTREE_LEN_SHORT`, `BKTREE_LEN_LONG`
+- `BKTREE_K_SHORT`, `BKTREE_K_MEDIUM`, `BKTREE_K_LONG`
+- `BKTREE_FETCH_CAP`
 
 These control both speed and behavior.
 
@@ -336,6 +472,12 @@ The module reads:
 ### Timing logs
 
 - `TIMINGS=1` enables detailed timing breakdown output in CLI mode.
+
+### BK-tree
+
+- `BKTREE_ENABLED=1` (default) builds the in-memory BK-tree for each table
+  on first use in CLI mode. Set to `0` to disable the BK-tree pool and skip
+  the startup build.
 
 ---
 
@@ -540,6 +682,8 @@ if hit:
 
 ## Changelog (high-level)
 
+- Added `BKTreeIndex` Levenshtein-neighbour candidate pool to recover from
+  typos inside the first characters of a name (e.g. `RICARDO` -> `RICCARDO`)
 - Added module-friendly `search_first_match()` for reuse
 - Added optional `TIMINGS` instrumentation
 - Added `POPULARITY` tie-breaker for equal RapidFuzz scores
