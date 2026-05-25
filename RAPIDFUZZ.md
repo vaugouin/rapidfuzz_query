@@ -669,6 +669,20 @@ if hit:
 
 ---
 
+## Docker runtime environment
+
+Do not bake local environment files or secrets into the Docker image. The build context excludes `.env` through `.dockerignore`, and the Dockerfile should only contain non-sensitive defaults.
+
+Keep the runtime environment file outside the app source tree and pass it when starting the container:
+
+```bash
+docker run --rm -it \
+  --env-file /home/debian/docker/<project-name>/.env \
+  rapidfuzz-query
+```
+
+---
+
 ## Notes / cautions
 
 - This module dynamically injects the **table/column identifiers** into SQL using backticks.
