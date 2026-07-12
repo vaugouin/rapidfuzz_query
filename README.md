@@ -160,13 +160,16 @@ python rapidfuzz_query.py
 At startup it builds the BK-tree (unless `BKTREE_ENABLED=0`) and then accepts commands:
 
 ```
-person <person_name>     # search T_WC_T2S_PERSON
-aka <person_name>        # search T_WC_TMDB_PERSON_ALSO_KNOWN_AS (enriched with canonical person)
+person <person_name>         # search T_WC_T2S_PERSON
+aka <person_name>            # search T_WC_TMDB_PERSON_ALSO_KNOWN_AS (enriched with canonical person)
+collection <collection_name> # search T_WC_T2S_COLLECTION (franchise-stopword neutralization on)
 help
 quit / exit / q
 ```
 
 Omitting the command word reuses the previously selected search set. Each result prints the validated/auto-corrected name (with Levenshtein distance and `ID_PERSON`), or a ranked suggestion list when confidence is low, plus per-tier timing details when `TIMINGS=1`.
+
+The `collection` target mirrors the `Collection_name` rapidfuzz strategy in `fastapi-text2sql` (`data/entity_resolution.json`). It sets `strip_franchise_stopwords`, so generic franchise words (`universe`, `franchise`, `saga`, `collection`, `film(s)`, `movie(s)`, `series`, `trilogy`/n-logies, and FR equivalents) are neutralized on both the query and, in-memory, each candidate — so e.g. `collection Star Wars universe` resolves confidently to *Star Wars Collection* without any stored-column backfill. Generated columns: [T2S_COLLECTION-rapidfuzz.sql](T2S_COLLECTION-rapidfuzz.sql). The neutralization list lives in `strip_franchise_words()` and is the source of truth to keep in sync with `COLLECTION_NAME_NORM`.
 
 ### Docker
 
