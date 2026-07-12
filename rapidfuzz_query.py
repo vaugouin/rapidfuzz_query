@@ -116,6 +116,65 @@ def to_key(s: str) -> str:
     """
     return normalize_name(s).replace(" ", "")
 
+# ----------------------------
+# Franchise-stopword neutralization (collections only)
+# ----------------------------
+# Generic franchise / collection words carry no identifying signal: a query like
+# "Star Wars universe" must resolve to the "Star Wars Collection" row. Neutralizing
+# these words on BOTH sides brings "star wars universe" ~ "star wars collection" to
+# fuzz.ratio 100 (embeddings/WRatio otherwise mis-rank it under "Marvel Cinematic
+# Universe" because "universe" matches "universe"). Applied ONLY to the collection
+# target, never to person names.
+#
+# This tuple is the SOURCE OF TRUTH and MUST be kept in sync with the
+# COLLECTION_NAME_NORM generated column (T2S_COLLECTION-rapidfuzz.sql) once the DB
+# column is extended for production. Decided with Philippe (2026-07-12): Tier 1
+# + series + n-logies; abbreviations (MCU, DCEU) and articles deliberately excluded.
+import unicodedata as _unicodedata
+
+_FRANCHISE_STOPWORD_WORDS = (
+    # English
+    "collection", "universe", "franchise", "saga",
+    "trilogy", "duology", "tetralogy", "quadrilogy", "pentalogy", "hexalogy", "heptalogy",
+    "film", "films", "movie", "movies", "series", "cinematic",
+    # French (franchise / saga / collection / film / films are identical to EN)
+    "univers", "trilogie", "duologie", "tétralogie", "quadrilogie",
+    "pentalogie", "hexalogie", "heptalogie", "série", "séries", "cinématographique",
+)
+
+
+def _fold_ascii(s: str) -> str:
+    """Lowercase + strip diacritics so accented FR words match whether or not the
+    upstream normalizer preserved accents (é -> e, série -> serie)."""
+    return "".join(
+        c for c in _unicodedata.normalize("NFKD", s.lower()) if not _unicodedata.combining(c)
+    )
+
+
+_FRANCHISE_STOPWORDS = frozenset(_fold_ascii(w) for w in _FRANCHISE_STOPWORD_WORDS)
+
+
+def strip_franchise_words(norm: str) -> str:
+    """Remove generic franchise/collection words from an ALREADY-normalized string.
+
+    Whole-word, accent-insensitive, idempotent (safe to apply to an already-stripped
+    value). Guard: if neutralization would empty the string (e.g. a query that is
+    literally "collection"), the input is returned unchanged.
+    """
+    if not norm:
+        return norm
+    kept = [tok for tok in norm.split() if _fold_ascii(tok) not in _FRANCHISE_STOPWORDS]
+    stripped = " ".join(kept)
+    return stripped if stripped else norm
+
+
+def normalize_collection_name(s: str) -> str:
+    """normalize_name() + franchise-stopword neutralization (collections only).
+
+    Keep byte-for-byte in sync with the COLLECTION_NAME_NORM generated column.
+    """
+    return strip_franchise_words(normalize_name(s))
+
 def build_boolean_query(tokens: List[str]) -> str:
     """Build a MariaDB FULLTEXT boolean query from normalized tokens.
 
@@ -532,18 +591,25 @@ def rank_candidates(
     strcolumnpopularity: str,
     q_norm: str,
     candidates: List[Dict[str, Any]],
+    strip_stopwords: bool = False,
 ) -> List[Dict[str, Any]]:
     """Rank candidate rows by lexical similarity using RapidFuzz.
 
     Args:
         q_norm: Normalized query string.
         candidates: Candidate row dicts.
+        strip_stopwords: When True, neutralize franchise/collection words in each
+            candidate's normalized name before scoring (test-side mirror of the
+            query neutralization; idempotent once the stored NORM column is stripped).
 
     Returns:
         A list of dicts containing the candidate fields plus a `SCORE` float.
     """
     # Dict choices: id -> norm for scoring
-    choices = {row[strcolumnid]: row[strcolumndescnorm] for row in candidates}
+    if strip_stopwords:
+        choices = {row[strcolumnid]: strip_franchise_words(row[strcolumndescnorm]) for row in candidates}
+    else:
+        choices = {row[strcolumnid]: row[strcolumndescnorm] for row in candidates}
     matches = process.extract(q_norm, choices, scorer=fuzz.WRatio, limit=TOP_K)
 
     id_to_row = {row[strcolumnid]: row for row in candidates}
@@ -601,6 +667,7 @@ def search_first_match(
     has_fulltext: bool,
     timings_enabled: bool = False,
     bktree: Optional[BKTreeIndex] = None,
+    strip_stopwords: bool = False,
 ) -> Dict[str, Any]:
     """Search for a person name and return the best match.
 
@@ -633,6 +700,8 @@ def search_first_match(
             - candidates_count: number of candidates fetched
     """
     q_norm = normalize_name(raw)
+    if strip_stopwords:
+        q_norm = strip_franchise_words(q_norm)
     if not q_norm:
         return {
             "hit": None,
@@ -644,7 +713,9 @@ def search_first_match(
             "candidates_count": 0,
         }
 
-    q_key = to_key(raw)
+    # Derive the prefix key from the (possibly stopword-stripped) q_norm so retrieval
+    # and scoring stay consistent. For the non-strip path this equals to_key(raw).
+    q_key = q_norm.replace(" ", "")
 
     t_exact0 = time.perf_counter() if timings_enabled else 0.0
     hit = exact_match(
@@ -694,6 +765,7 @@ def search_first_match(
         strcolumnpopularity,
         q_norm,
         candidates,
+        strip_stopwords=strip_stopwords,
     )
     t_rank1 = time.perf_counter() if timings_enabled else 0.0
 
@@ -826,6 +898,7 @@ def search_first_match_configured(
         state_has_fulltext,
         timings_enabled=timings_enabled,
         bktree=state_bktree if isinstance(state_bktree, BKTreeIndex) else None,
+        strip_stopwords=bool(search_cfg.get("strip_franchise_stopwords")),
     )
 
     def _wrap_row(row: Optional[Dict[str, Any]], score: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -915,6 +988,29 @@ def main():
             ],
             "enrich_mode": "best_only",
         },
+        # Collection resolution (T2S_COLLECTION). Mirrors the `Collection_name`
+        # rapidfuzz strategy in fastapi-text2sql/data/entity_resolution.json
+        # (search_mode=rapidfuzz on COLLECTION_NAME_NORM/_KEY). Lets us reproduce
+        # franchise/universe queries (e.g. "collection Star Wars universe") against
+        # the exact production lexical path, not just the embeddings fallback that
+        # embedding-query exercises. Generated columns: T2S_COLLECTION-rapidfuzz.sql.
+        "collection": {
+            "search": {
+                "table": "T_WC_T2S_COLLECTION",
+                "id": "ID_T2S_COLLECTION",
+                "desc": "COLLECTION_NAME",
+                "norm": "COLLECTION_NAME_NORM",
+                "key": "COLLECTION_NAME_KEY",
+                "pop": "POPULARITY",
+                # Neutralize generic franchise words on both the query and (in-memory)
+                # each candidate NORM, so "Star Wars universe" resolves to "Star Wars
+                # Collection". Test-side today; production mirrors it in the stored
+                # NORM column (step 3). See strip_franchise_words().
+                "strip_franchise_stopwords": True,
+            },
+            "enrich": [],
+            "enrich_mode": "best_only",
+        },
     }
 
     table_state: Dict[str, Dict[str, Any]] = {}
@@ -960,6 +1056,7 @@ def main():
     print("Commands:")
     print("  person <person_name>")
     print("  aka <person_name>")
+    print("  collection <collection_name>")
     print("(If you omit the command, the previous command is reused.)")
     print("Type 'quit' to exit.\n")
 
@@ -979,6 +1076,7 @@ def main():
             print("\nCommands:")
             print("  person <person_name>")
             print("  aka <person_name>")
+            print("  collection <collection_name>")
             print("  help")
             print("  quit / exit / q\n")
             continue

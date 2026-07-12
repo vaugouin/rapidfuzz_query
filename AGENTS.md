@@ -1,4 +1,4 @@
-# AGENTS.md - Agent Guide for Embedding Update
+# AGENTS.md - Agent Guide for RapidFuzz Query
 
 This file gives you the agentic context you need to work on this codebase safely. For project overview, features, install / deploy steps and human-facing security / performance / troubleshooting material, read @README.md — that file is canonical and not duplicated here.
 
@@ -10,6 +10,24 @@ Deeper specs live in their own files:
 - For any project update, keep documentation aligned:
   - Update `README.md` for user-facing behavior, configuration, setup, deployment, troubleshooting, or verification changes.
   - Update this file only when agent workflow or safety context changes.
+
+---
+
+## Related repositories (project ecosystem)
+
+`rapidfuzz_query` is one stage of **Agent BBB**, a multi-repository movie/TV database system owned by GitHub user `vaugouin`. All sibling repos live under `%USERPROFILE%/Code/<repo>` and at `github.com/vaugouin/<repo>`; they are interdependent stages of one pipeline that converges on a shared MySQL/MariaDB database (`T_WC_*` tables) and a ChromaDB vector store. The canonical roster of sibling repositories is kept in `doc/related-repositories/related-repositories.txt` in the `tmdb-front` repo.
+
+Pipeline stages:
+- **Infrastructure** — `python` (shared crawler base image), `chromadb` (vector service), `reverseproxy` (NGINX TLS ingress), `chromadb-security-test` (firewall validation).
+- **Acquisition** — `tmdb-crawler`, `imdb-crawler`, `sparql-crawler`, `sparql-movies-persons`, `wikidata-crawler`, `wikipedia-crawler`, `selenium-tmdb`, `download-images`, `sqlite-plex-to-tmdb`, `movieparadise`.
+- **Preprocessing → `T_WC_T2S_*`** — `tmdb-movie-preprocess`, `tmdb-person-preprocess`, `keywords-processing`.
+- **Semantic index & name resolution** — `embedding-update`, `embedding-query`, `rapidfuzz_query`.
+- **Serving** — `fastapi-text2sql` (NL→SQL API + MCP server), `voice-agent`, `tmdb-front` (PHP web front-end).
+- **Evaluation** — `eval-text2sql`, `extract-movie-questions`.
+- **Maintenance & tooling** — `plex-duplicates`, `subtitle-translate`, `powershell`, `playwright-test`.
+- **Monitoring & observability** — `data-monitoring`.
+
+**This repository's role:** Name-resolution stage. An importable module that resolves approximate person names via three-tier indexed candidate retrieval plus RapidFuzz WRatio ranking. Imported directly by `fastapi-text2sql` to resolve person entities in user queries.
 
 ---
 
@@ -69,5 +87,23 @@ Keep Markdown, prompt files, JSON config, and logs UTF-8. These files contain no
 
 ---
 
-**Last Updated**: 2026-05-18
+## Build & deployment (Docker)
+
+A `Dockerfile` (base `python:3.12-slim-bookworm`) is provided: it installs `requirements.txt`, copies the repo into `/app`, and has `CMD ["python", "rapidfuzz_query.py"]` for standalone runs. In production this is primarily an importable module consumed in-process by `fastapi-text2sql`, so it is deployed as part of that service's container rather than as a long-running container of its own. No exposed ports or volumes; `.env` is excluded by `.dockerignore` and supplied at runtime.
+
+---
+
+**Last Updated**: 2026-06-03
 **Current Version**: 1.0.0 
+
+## Backlog (Nestor second-brain)
+
+The prioritized, agent-ready implementation backlog for this repo lives in the **Nestor**
+knowledge repo (a separate repo, not cloned alongside this one):
+
+- This repo: `C:\Users\vaugo\Nestor\projets\t2s-backlog\repos\rapidfuzz-query.md`
+- Cross-repo dashboard: `C:\Users\vaugo\Nestor\projets\t2s-backlog\index.md`
+
+Consult it before implementing: tasks are `RAPIDFUZZ-QUERY-NNN` with status (done / in-progress /
+todo), priority, and quick-wins. NOTE: these are local paths on Philippe's PC and do not
+resolve on the VPS or on cloud agents (claude.ai/code).
