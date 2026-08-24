@@ -32,7 +32,6 @@ local_chromadb_topics_en/
 *.log
 
 # IDE
-.vscode/
 .idea/
 
 # OS
