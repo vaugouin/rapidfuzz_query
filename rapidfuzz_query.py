@@ -968,7 +968,7 @@ def main():
         },
         "aka": {
             "search": {
-                "table": "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+                "table": "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
                 "id": "ID_ROW",
                 "desc": "PERSON_NAME",
                 "norm": "PERSON_NAME_NORM",

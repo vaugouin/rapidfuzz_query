@@ -23,7 +23,7 @@ In CLI mode, a small `configs` structure in `main()` defines which table/columns
 Supported commands/tables in the current version:
 
 - `person` -> `T_WC_T2S_PERSON`
-- `aka` -> `T_WC_TMDB_PERSON_ALSO_KNOWN_AS`
+- `aka` -> `T_WC_T2S_PERSON_ALSO_KNOWN_AS`
 
 ### Config structure (CLI)
 
@@ -38,7 +38,7 @@ High-level shape:
 configs = {
   "aka": {
     "search": {
-      "table": "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+      "table": "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
       "id": "ID_ROW",
       "desc": "PERSON_NAME",
       "norm": "PERSON_NAME_NORM",
@@ -399,7 +399,7 @@ For the `aka` command, the CLI enriches the match using `ID_PERSON` to lookup th
 
 So an AKA exact match can display:
 
-- `ID_ROW` (row in `T_WC_TMDB_PERSON_ALSO_KNOWN_AS`)
+- `ID_ROW` (row in `T_WC_T2S_PERSON_ALSO_KNOWN_AS`)
 - `ID_PERSON` (canonical person id)
 - canonical English `PERSON_NAME` (from `T_WC_T2S_PERSON`)
 
@@ -449,7 +449,7 @@ The built-in CLI configuration targets these tables:
   - `PERSON_NAME_NORM`, `PERSON_NAME_KEY`
   - `POPULARITY` (tie-breaker)
 
-- `T_WC_TMDB_PERSON_ALSO_KNOWN_AS`
+- `T_WC_T2S_PERSON_ALSO_KNOWN_AS`
   - `ID_ROW` (id)
   - `PERSON_NAME` (display)
   - `PERSON_NAME_NORM`, `PERSON_NAME_KEY`
@@ -595,13 +595,13 @@ cur = conn.cursor()
 
 has_fulltext = rapidfuzz_query.db_has_fulltext(
     cur,
-    "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+    "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
     "PERSON_NAME_NORM",
 )
 
 result = rapidfuzz_query.search_first_match(
     cur,
-    "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+    "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
     "ID_ROW",
     "PERSON_NAME",
     "PERSON_NAME_NORM",
@@ -624,7 +624,7 @@ cur = conn.cursor()
 
 cfg = {
     "search": {
-        "table": "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+        "table": "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
         "id": "ID_ROW",
         "desc": "PERSON_NAME",
         "norm": "PERSON_NAME_NORM",
@@ -632,7 +632,7 @@ cfg = {
         "pop": "ID_PERSON",
         "has_fulltext": rapidfuzz_query.db_has_fulltext(
             cur,
-            "T_WC_TMDB_PERSON_ALSO_KNOWN_AS",
+            "T_WC_T2S_PERSON_ALSO_KNOWN_AS",
             "PERSON_NAME_NORM",
         ),
     },

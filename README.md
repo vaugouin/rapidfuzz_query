@@ -142,7 +142,7 @@ Defined near the top of [rapidfuzz_query.py](rapidfuzz_query.py):
 The target table must expose the `STORED` generated columns and indexes defined in the bundled SQL:
 
 - [T2S_PERSON-rapidfuzz.sql](T2S_PERSON-rapidfuzz.sql) — adds `PERSON_NAME_NORM`, `PERSON_NAME_KEY`, their indexes, and the `ft_person_name_norm` FULLTEXT index to `T_WC_T2S_PERSON`.
-- [T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql](T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql) — the equivalent for the alias table (Unicode-aware normalization).
+- [T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql](T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql), the equivalent for the alias table (Unicode-aware normalization). It documents the TMDb source table; the `aka` command reads its T2S copy `T_WC_T2S_PERSON_ALSO_KNOWN_AS` (aliases of the persons in `T_WC_T2S_PERSON` only, same generated columns, built by `tmdb-movie-preprocess` Process 51, TMDB-MOVIE-PREPROCESS-054).
 
 `db_has_norm_columns()` and `db_has_fulltext()` probe `INFORMATION_SCHEMA` / `SHOW INDEX` at startup so the module degrades gracefully when the FULLTEXT index is absent.
 
@@ -161,7 +161,7 @@ At startup it builds the BK-tree (unless `BKTREE_ENABLED=0`) and then accepts co
 
 ```
 person <person_name>         # search T_WC_T2S_PERSON
-aka <person_name>            # search T_WC_TMDB_PERSON_ALSO_KNOWN_AS (enriched with canonical person)
+aka <person_name>            # search T_WC_T2S_PERSON_ALSO_KNOWN_AS (enriched with canonical person)
 collection <collection_name> # search T_WC_T2S_COLLECTION (franchise-stopword neutralization on)
 help
 quit / exit / q
