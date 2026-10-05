@@ -33,6 +33,8 @@ Pipeline stages:
 
 ## Where things live (file → role)
 
+**`rapidfuzz_query.py` is a copy; never edit it here (RAPIDFUZZ-QUERY-006, 2026-10-05).** The source of truth is `fastapi-text2sql/rapidfuzz_query.py`, the module the API actually imports. Make every change there, then copy the file as is (`cp ../fastapi-text2sql/rapidfuzz_query.py .`) and check that `cmp` between the two returns nothing. The CLI of this repo must resolve names exactly as the API does.
+
 Edit at the right layer; the architecture is intentionally split.
 
 ## Code conventions

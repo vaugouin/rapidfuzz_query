@@ -35,7 +35,7 @@ except ImportError:
 
 import pymysql
 from rapidfuzz import process, fuzz
-from rapidfuzz.distance import Levenshtein
+from rapidfuzz.distance import Levenshtein, DamerauLevenshtein
 
 def levenshtein_distance(a: str, b: str) -> int:
     return int(Levenshtein.distance(a or "", b or ""))
@@ -131,6 +131,7 @@ def to_key(s: str) -> str:
 # column is extended for production. Decided with Philippe (2026-07-12): Tier 1
 # + series + n-logies; abbreviations (MCU, DCEU) and articles deliberately excluded.
 import unicodedata as _unicodedata
+from functools import lru_cache as _lru_cache
 
 _FRANCHISE_STOPWORD_WORDS = (
     # English
@@ -153,19 +154,193 @@ def _fold_ascii(s: str) -> str:
 
 _FRANCHISE_STOPWORDS = frozenset(_fold_ascii(w) for w in _FRANCHISE_STOPWORD_WORDS)
 
+# ---- Retrait TOLERANT AUX FAUTES DE FRAPPE (FASTAPI-TEXT2SQL-236, 2026-08-31) --------
+#
+# POURQUOI. Le retrait par egalite exacte est ASYMETRIQUE des que le descripteur porte
+# une faute, et l'asymetrie joue toujours dans le mauvais sens : le cote STOCKE est
+# propre par construction et se fait neutraliser, le cote TAPE garde son « collecion ».
+# On compare alors « cube collecion » a « cube ». Mesure du banc du 2026-08-31 : les
+# VINGT-ET-UN positifs refuses par la garde etaient tous de cette famille, quinze avec le
+# bon candidat en face. « Cube Collecion » notait 44,4 et « John Wick Cllection » 64,3.
+#
+# LE REGLAGE, et chacun de ses trois termes a ete mesure, pas devine.
+#
+# DAMERAU plutot que Levenshtein : la transposition est la faute la plus frequente, et
+# elle coute 2 en Levenshtein contre 1 en Damerau. « colelction », « collectoin »,
+# « trilgoy » sont a distance 1 en Damerau et seraient manques autrement. Sur les 31
+# fautes observees, Damerau en attrape 30, Levenshtein 21.
+#
+# DISTANCE 1 et pas 2, et c'est la que se joue la casse collaterale. A distance 2,
+# « connection » tombe a portee de « collection » : « The French Connection » perdrait
+# son mot. A distance 1 il est hors d'atteinte.
+#
+# LONGUEUR MINIMALE 6, des deux cotes. Elle protege les mots courts, « cube » ne peut
+# pas etre avale, et elle exclut du rapprochement flou les descripteurs courts, « la »
+# ne peut pas manger « le ». Seuls les descripteurs longs (collection, trilogy,
+# franchise...) sont approches.
+#
+# LE FAUX RETRAIT QUI SUBSISTE, nomme plutot que masque : « francoise » est a distance 1
+# de « franchise ». Un prenom serait donc neutralise. Le degat reste faible parce que le
+# retrait s'applique aux DEUX cotes : un « Francoise » present des deux cotes disparait
+# des deux cotes et la comparaison n'en souffre pas. Il ne coute que la ou un seul cote
+# le porte. Un seul token sur les 400 observes.
+_FUZZY_STOPWORD_MIN_LEN = 6
+_FUZZY_STOPWORD_MAX_DISTANCE = 1
 
-def strip_franchise_words(norm: str) -> str:
+
+@_lru_cache(maxsize=8192)
+def _is_near_stopword(token: str, vocabulary: frozenset) -> bool:
+    """Le token est-il une faute de frappe d'un descripteur de ce vocabulaire ?
+
+    Mis en cache : `rank_candidates` neutralise CHAQUE candidat du vivier, donc le meme
+    token revient des milliers de fois par requete. Le pre-filtre sur la difference de
+    longueur ecarte la quasi-totalite des comparaisons avant de payer une distance.
+    """
+    if len(token) < _FUZZY_STOPWORD_MIN_LEN:
+        return False
+    for word in vocabulary:
+        if len(word) < _FUZZY_STOPWORD_MIN_LEN:
+            continue
+        if abs(len(token) - len(word)) > _FUZZY_STOPWORD_MAX_DISTANCE:
+            continue
+        if DamerauLevenshtein.distance(token, word) <= _FUZZY_STOPWORD_MAX_DISTANCE:
+            return True
+    return False
+
+
+def strip_franchise_words(norm: str, words=None) -> str:
     """Remove generic franchise/collection words from an ALREADY-normalized string.
 
     Whole-word, accent-insensitive, idempotent (safe to apply to an already-stripped
     value). Guard: if neutralization would empty the string (e.g. a query that is
     literally "collection"), the input is returned unchanged.
+
+    `words` overrides the franchise set with a per-entity one (FASTAPI-TEXT2SQL-206), read
+    from `score_stopwords` in entity_resolution.json. Default stays the franchise set, so
+    every existing caller keeps its behaviour to the letter.
     """
     if not norm:
         return norm
-    kept = [tok for tok in norm.split() if _fold_ascii(tok) not in _FRANCHISE_STOPWORDS]
+    vocabulary = _FRANCHISE_STOPWORDS if words is None else frozenset(_fold_ascii(w) for w in words)
+    if not vocabulary:
+        return norm
+    kept = []
+    for tok in norm.split():
+        folded = _fold_ascii(tok)
+        if folded in vocabulary:
+            continue
+        # -236 : la meme neutralisation, tolerante a UNE faute de frappe. Voir la note
+        # posee sur _is_near_stopword pour le choix de la distance et de la longueur.
+        if _is_near_stopword(folded, vocabulary):
+            continue
+        kept.append(tok)
     stripped = " ".join(kept)
     return stripped if stripped else norm
+
+
+# ---- Typographic rescue of the embeddings gate (FASTAPI-TEXT2SQL-309, 2026-10-04) -------------
+#
+# WHY. The gate scores `fuzz.ratio` on lowercased strings, and that counts as edits differences
+# that carry no identity. Measured on eval 475: "Bell' Antonio" against the catalogued
+# "Il bell'Antonio" scores 85.7 for a movie threshold of 85.85, the right film sitting at rank 1 of
+# the shortlist (distance 0.361). One of the four characters counted against it is the space typed
+# after the elision apostrophe; the French spelling of the same eval, "Bell'Antonio", scores 88.9.
+#
+# WHAT. These functions normalise BOTH sides for a second scoring pass only, run when the gate has
+# already rejected every candidate (see entity.py). They never touch what is written into the SQL,
+# which stays the stored title. Each one is opt-in per strategy through `rescue_normalizations` in
+# entity_resolution.json, by its key in RESCUE_NORMALIZERS.
+#
+# NOT HERE, ON PURPOSE. Leading articles ("il", "the", "die"): they raise every score carrying one,
+# so they loosen the gate, and several are words in another language (Die Hard, Las Vegas). Accents
+# and hyphens: candidates to measure, each shipped on its own figures (see the ticket).
+
+# Every form an apostrophe takes in typed or pasted text: right and left single quotation marks,
+# modifier letter apostrophe, acute accent, grave accent (backtick), prime.
+_APOSTROPHE_VARIANTS_RE = re.compile("[’‘ʼ´`′]")
+# Spaces on either side of an apostrophe: "bell' antonio", "l' avventura", "rock 'n' roll".
+_APOSTROPHE_SPACING_RE = re.compile(r"\s*'\s*")
+
+
+def normalize_apostrophes(s: str) -> str:
+    """One apostrophe form, and no space around it. "Bell’ Antonio" -> "Bell'Antonio".
+
+    Two different titles can only become equal here if they differ by nothing but an apostrophe
+    form or the spaces around it, which makes them the same title. Possessives ("schindler's
+    list") have no space and come out unchanged. Idempotent.
+    """
+    if not s:
+        return s
+    return _APOSTROPHE_SPACING_RE.sub("'", _APOSTROPHE_VARIANTS_RE.sub("'", s))
+
+
+def normalize_accents(s: str) -> str:
+    """Diacritics removed: "amélie" -> "amelie", "fenêtre" -> "fenetre". Measured: "amelie"
+    against "amélie" scores 83.3 on fuzz.ratio, refused by the movie threshold of 85.85. Typed
+    without accents by French users on an English keyboard, and by voice transcription. Same
+    folding as `_fold_ascii`, which the franchise word lists already use."""
+    if not s:
+        return s
+    return "".join(c for c in _unicodedata.normalize("NFKD", s) if not _unicodedata.combining(c))
+
+
+# Hyphen, non-breaking hyphen, figure dash, en dash, em dash, minus sign, underscore.
+_DASHES_RE = re.compile("[\\-‐‑‒–—−_]+")
+_MULTISPACE_RE = re.compile(r"\s+")
+
+
+def normalize_dashes(s: str) -> str:
+    """Every dash becomes a space: "spider-man" and "spider man" compare equal."""
+    if not s:
+        return s
+    return _MULTISPACE_RE.sub(" ", _DASHES_RE.sub(" ", s)).strip()
+
+
+# Punctuation that carries no identity in a title typed from memory. NOT the apostrophe (its own
+# normaliser keeps it, since "l'avventura" and "lavventura" are different spellings), NOT "&"
+# ("and" or "et" depending on the language), NOT digits.
+_PUNCTUATION_RE = re.compile("[.,:;!?¡¿\"«»“”„()\\[\\]{}*…/]+")
+
+
+def normalize_punctuation(s: str) -> str:
+    """Punctuation removed: "mission: impossible" -> "mission impossible", "e.t." -> "et",
+    "mother!" -> "mother". The last one is the collision to watch: *mother!* (2017) and *Mother*
+    (2009) both exist, which the exact-match stage protects only when the title is typed exactly."""
+    if not s:
+        return s
+    return _MULTISPACE_RE.sub(" ", _PUNCTUATION_RE.sub(" ", s)).strip()
+
+
+RESCUE_NORMALIZERS = {
+    "apostrophes": normalize_apostrophes,
+    "accents": normalize_accents,
+    "dashes": normalize_dashes,
+    "punctuation": normalize_punctuation,
+}
+
+# The order they are applied in, whatever the order of the configuration list. It matters:
+# the acute accent "´" is an apostrophe form, and folding accents first would turn it into a
+# space plus a combining mark instead.
+_RESCUE_ORDER = ("apostrophes", "accents", "dashes", "punctuation")
+
+# The stages of the -309 evaluation, so the eval script and the configuration share one name.
+RESCUE_STAGES = {
+    "none": [],
+    "apostrophes": ["apostrophes"],
+    "full": list(_RESCUE_ORDER),
+}
+
+
+def apply_rescue_normalizers(s: str, names) -> str:
+    """Apply the named normalisers, in the canonical order. An unknown name raises: a typo in the
+    configuration must not silently disable the rescue it was meant to switch on."""
+    wanted = set(names or ())
+    for name in wanted:
+        RESCUE_NORMALIZERS[name]  # raises KeyError on an unknown name
+    for name in _RESCUE_ORDER:
+        if name in wanted:
+            s = RESCUE_NORMALIZERS[name](s)
+    return s
 
 
 def normalize_collection_name(s: str) -> str:
@@ -174,6 +349,87 @@ def normalize_collection_name(s: str) -> str:
     Keep byte-for-byte in sync with the COLLECTION_NAME_NORM generated column.
     """
     return strip_franchise_words(normalize_name(s))
+
+# ----------------------------
+# Scoring metrics (FASTAPI-TEXT2SQL-214 / -218)
+# ----------------------------
+# The metric belongs to the ENTITY, not to the code, exactly like `score_stopwords` and
+# `document_name_separator`. `fuzz.ratio` was preferred to `WRatio` because the token
+# component let unrelated collections through on a shared "... Collection" suffix; that was
+# right for collections and wrong for person aliases, where TMDb stores the birth name in
+# full ("Marion Robert Morrison") and an inserted middle name is an INCLUSION, not an error.
+#
+# One metric, used at both ends (-218). Before this, `rank_candidates` chose with `WRatio`
+# and `entity.py` judged the winner with `fuzz.ratio`: two rules, so the gate could reject a
+# candidate the ranker had picked while a better one sat at rank 2, unread.
+
+DEFAULT_SCORE_METRIC = "ratio"
+# A middle name is one extra token. Configurable per strategy because a birth name can carry
+# two ("Allan Stewart Konigsberg" is +1, some are +2), and because widening this is exactly
+# the kind of decision that wants a bench run rather than a guess.
+DEFAULT_MAX_EXTRA_TOKENS = 1
+
+# Generational suffixes carry no identity, exactly like the franchise stopwords of -206: they
+# say which bearer of a name, never which name. TMDb stores Michael Caine's birth name as
+# "Maurice Joseph Micklewhite Jr.", so a user typing the two-word form is +2 tokens away and
+# the extra-token guard refuses it. Neutralising the suffix brings it back to +1, a middle
+# name, which is the case the guard was written for. Raising max_extra_tokens to 2 instead
+# would have worked here and opened the door to "Sarah Connor" matching "Sarah Connor Jones
+# Smith": the suffix is the precise fix, the wider guard is the blunt one.
+NAME_SUFFIX_TOKENS = frozenset({"jr", "sr", "jnr", "snr", "ii", "iii", "iv"})
+
+
+def score_ratio(q_norm: str, candidate_norm: str, **_: Any) -> float:
+    """Plain `fuzz.ratio`, the historical metric. Length-normalised, punishes insertion."""
+    return float(fuzz.ratio(q_norm or "", candidate_norm or ""))
+
+
+def score_token_subset(q_norm: str, candidate_norm: str, max_extra_tokens: int = DEFAULT_MAX_EXTRA_TOKENS, **_: Any) -> float:
+    """`ratio`, except that a strict token inclusion scores 100 (FASTAPI-TEXT2SQL-214).
+
+    Three guards, because the naive fix opens a door: `token_set_ratio("marion", "marion
+    robert morrison")` is also 100, so a one-word query would match every long name sharing
+    it.
+
+    1. The query needs **at least two tokens**. One word is never an inclusion, it is a prefix.
+    2. **Every** query token must appear in the candidate.
+    3. The candidate may carry at most `max_extra_tokens` tokens beyond the query, which is
+       what a middle name is. Without it, "Sarah Connor" would score 100 against "Sarah
+       Connor Jones Smith" and the metric would be a wildcard.
+
+    Generational suffixes are neutralised on both sides before the count, so "Maurice
+    Micklewhite" reaches "Maurice Joseph Micklewhite Jr." as a +1 inclusion rather than a +2
+    refusal. They are dropped for the COUNT and the membership test only; the `fuzz.ratio`
+    fallback below still sees the untouched strings, so no measured score moves.
+
+    Monotone by construction: it returns either 100 or exactly `fuzz.ratio`, never less. An
+    existing `min_fuzz_ratio` therefore stays valid as an upper bound of strictness while the
+    bench recalibrates it; the change can only admit inclusions, never refuse what passed.
+    """
+    q_tokens = [t for t in (q_norm or "").split() if t and t not in NAME_SUFFIX_TOKENS]
+    c_tokens = [t for t in (candidate_norm or "").split() if t and t not in NAME_SUFFIX_TOKENS]
+    if len(q_tokens) >= 2 and c_tokens:
+        c_set = set(c_tokens)
+        extra = len(c_tokens) - len(q_tokens)
+        if 0 <= extra <= max_extra_tokens and all(t in c_set for t in q_tokens):
+            return 100.0
+    return float(fuzz.ratio(q_norm or "", candidate_norm or ""))
+
+
+SCORE_METRICS = {
+    "ratio": score_ratio,
+    "token_subset": score_token_subset,
+}
+
+
+def resolve_score_metric(name: Optional[str]) -> Any:
+    """Return the scoring callable for `name`, falling back to the default when unknown.
+
+    Unknown names fall back rather than raise: a typo in `entity_resolution.json` must
+    degrade to the historical behaviour, not take the resolver down.
+    """
+    return SCORE_METRICS.get((name or DEFAULT_SCORE_METRIC).strip().lower(), score_ratio)
+
 
 def build_boolean_query(tokens: List[str]) -> str:
     """Build a MariaDB FULLTEXT boolean query from normalized tokens.
@@ -398,6 +654,55 @@ def db_has_fulltext(
     )
     return cur.fetchone() is not None
 
+def build_select_prefix(
+    strtablename: str,
+    strcolumnid: str,
+    strcolumndesc: str,
+    strcolumndescnorm: str,
+    strcolumnpopularity: str,
+    popularity_join: Optional[Dict[str, str]] = None,
+) -> str:
+    """Build the shared `SELECT ... FROM ...` head, with an optional tie-break join.
+
+    FASTAPI-TEXT2SQL-218, Do #3. `rank_candidates` breaks a score tie on the popularity
+    column, and the alias table has none, so `entity_resolution.json` pointed the setting at
+    `ID_PERSON`: ties were decided by the highest TMDb id, that is by whoever was added to
+    TMDb most recently. It ranked the obscure above the famous, the exact opposite of the
+    intent, and it is what put "Maurice Maurice" ahead of Michael Caine (id 3895).
+
+    This matters MORE after the metric change, not less: `token_subset` returns a flat 100 to
+    every candidate that contains the query, so ties are now common by design and the
+    tie-break carries real weight.
+
+    The joined value is aliased to `strcolumnpopularity`, so every caller keeps reading the
+    same key and nothing downstream needs to know a join happened. Absent the config, the
+    query is byte-for-byte the previous one.
+    """
+    cols = (
+        f"`t`.`{strcolumnid}`, `t`.`{strcolumndesc}`, `t`.`{strcolumndescnorm}`"
+    )
+    if popularity_join:
+        jt = popularity_join["table"]
+        jid = popularity_join["id_column"]
+        jval = popularity_join["value_column"]
+        jfrom = popularity_join["from_column"]
+        # The join key must stay in the SELECT: `resolve_to_canonical` reads it off the matched
+        # row to reach the canonical name, and it used to arrive only because it doubled as the
+        # popularity column. Losing it here would silently degrade every alias hit to the AKA
+        # spelling instead of the credited one.
+        if jfrom not in {strcolumnid, strcolumndesc, strcolumndescnorm}:
+            cols += f", `t`.`{jfrom}`"
+        return (
+            f"SELECT {cols}, COALESCE(`j`.`{jval}`, 0) AS `{strcolumnpopularity}` "
+            f"FROM `{strtablename}` `t` "
+            f"LEFT JOIN `{jt}` `j` ON `j`.`{jid}` = `t`.`{jfrom}` "
+        )
+    return (
+        f"SELECT {cols}, `t`.`{strcolumnpopularity}` "
+        f"FROM `{strtablename}` `t` "
+    )
+
+
 def exact_match(
     cur,
     strtablename: str,
@@ -406,6 +711,7 @@ def exact_match(
     strcolumndescnorm: str,
     strcolumnpopularity: str,
     q_norm: str,
+    popularity_join: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Find an exact normalized match in the database.
 
@@ -418,12 +724,11 @@ def exact_match(
     """
     # Exact match on normalized form (fast with index on PERSON_NAME_NORM)
     cur.execute(
-        f"""
-        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
-        FROM `{strtablename}`
-        WHERE `{strcolumndescnorm}` = %s
-        LIMIT 1
-        """,
+        build_select_prefix(
+            strtablename, strcolumnid, strcolumndesc, strcolumndescnorm,
+            strcolumnpopularity, popularity_join,
+        )
+        + f"WHERE `t`.`{strcolumndescnorm}` = %s LIMIT 1",
         (q_norm,),
     )
     row = cur.fetchone()
@@ -444,6 +749,7 @@ def fetch_candidates(
     has_fulltext: bool,
     timings: Optional[Dict[str, Any]] = None,
     bktree: Optional[BKTreeIndex] = None,
+    popularity_join: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[int, str, str]]:
     """Fetch candidate rows that may match the query.
 
@@ -471,13 +777,12 @@ def fetch_candidates(
     prefix = q_key[:prefix_len]
 
     t0 = time.perf_counter() if timings is not None else 0.0
+    select_prefix = build_select_prefix(
+        strtablename, strcolumnid, strcolumndesc, strcolumndescnorm,
+        strcolumnpopularity, popularity_join,
+    )
     cur.execute(
-        f"""
-        SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
-        FROM `{strtablename}`
-        WHERE `{strcolumndesckey}` LIKE CONCAT(%s, '%%')
-        LIMIT %s
-        """,
+        select_prefix + f"WHERE `t`.`{strcolumndesckey}` LIKE CONCAT(%s, '%%') LIMIT %s",
         (prefix, PREFIX_LIMIT),
     )
     rows = cur.fetchall() or []
@@ -504,11 +809,7 @@ def fetch_candidates(
             if ids_to_fetch:
                 placeholders = ",".join(["%s"] * len(ids_to_fetch))
                 cur.execute(
-                    f"""
-                    SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
-                    FROM `{strtablename}`
-                    WHERE `{strcolumnid}` IN ({placeholders})
-                    """,
+                    select_prefix + f"WHERE `t`.`{strcolumnid}` IN ({placeholders})",
                     ids_to_fetch,
                 )
                 bk_rows = cur.fetchall() or []
@@ -532,12 +833,7 @@ def fetch_candidates(
         t1 = time.perf_counter() if timings is not None else 0.0
         ftx_query = build_boolean_query(tokens)
         cur.execute(
-            f"""
-            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
-            FROM `{strtablename}`
-            WHERE MATCH(`{strcolumndescnorm}`) AGAINST (%s IN BOOLEAN MODE)
-            LIMIT %s
-            """,
+            select_prefix + f"WHERE MATCH(`t`.`{strcolumndescnorm}`) AGAINST (%s IN BOOLEAN MODE) LIMIT %s",
             (ftx_query, FTX_LIMIT),
         )
         rows2 = cur.fetchall() or []
@@ -557,12 +853,7 @@ def fetch_candidates(
         t2 = time.perf_counter() if timings is not None else 0.0
         t = tokens[0]
         cur.execute(
-            f"""
-            SELECT `{strcolumnid}`, `{strcolumndesc}`, `{strcolumndescnorm}`, `{strcolumnpopularity}`
-            FROM `{strtablename}`
-            WHERE `{strcolumndescnorm}` LIKE CONCAT('%%', %s, '%%')
-            LIMIT %s
-            """,
+            select_prefix + f"WHERE `t`.`{strcolumndescnorm}` LIKE CONCAT('%%', %s, '%%') LIMIT %s",
             (t, LIKE_LIMIT),
         )
         rows3 = cur.fetchall() or []
@@ -592,8 +883,23 @@ def rank_candidates(
     q_norm: str,
     candidates: List[Dict[str, Any]],
     strip_stopwords: bool = False,
+    score_metric: Optional[str] = None,
+    max_extra_tokens: int = DEFAULT_MAX_EXTRA_TOKENS,
 ) -> List[Dict[str, Any]]:
-    """Rank candidate rows by lexical similarity using RapidFuzz.
+    """Rank candidate rows by lexical similarity, using the metric the GATE will apply.
+
+    FASTAPI-TEXT2SQL-218. This used to rank with `fuzz.WRatio` while the confidence gate in
+    `entity.py` judged the winner with `fuzz.ratio`. `WRatio` returns exactly 95.0 for a token
+    subset and for a token superset alike, so on "maurice micklewhite" both "Maurice Maurice"
+    and "Maurice Joseph Micklewhite" scored 95.0; the tie fell to the popularity column, which
+    on the alias table is `ID_PERSON`, so the person most recently added to TMDb won and
+    Michael Caine (id 3895) lost. The gate then measured that arbitrary winner with a stricter
+    metric and refused it, while the right row sat unread at rank 2.
+
+    `SCORE` is now the gate's own metric, so the candidate handed over is the best one BY THE
+    RULE THAT WILL JUDGE IT. `SCORE_WRATIO` is kept alongside for `decide_autocorrect`, whose
+    `AUTO_SCORE` / `MIN_MARGIN` were calibrated on the WRatio scale: changing what is ranked
+    must not silently re-tune what is auto-corrected.
 
     Args:
         q_norm: Normalized query string.
@@ -601,28 +907,38 @@ def rank_candidates(
         strip_stopwords: When True, neutralize franchise/collection words in each
             candidate's normalized name before scoring (test-side mirror of the
             query neutralization; idempotent once the stored NORM column is stripped).
+        score_metric: Name of the metric from `SCORE_METRICS`; defaults to `ratio`.
+        max_extra_tokens: Passed to the metric when it accepts one (`token_subset`).
 
     Returns:
-        A list of dicts containing the candidate fields plus a `SCORE` float.
+        A list of dicts containing the candidate fields plus `SCORE` and `SCORE_WRATIO`.
     """
+    metric = resolve_score_metric(score_metric)
+
     # Dict choices: id -> norm for scoring
     if strip_stopwords:
         choices = {row[strcolumnid]: strip_franchise_words(row[strcolumndescnorm]) for row in candidates}
     else:
         choices = {row[strcolumnid]: row[strcolumndescnorm] for row in candidates}
-    matches = process.extract(q_norm, choices, scorer=fuzz.WRatio, limit=TOP_K)
+
+    # Scored over the WHOLE pool, then truncated. `process.extract(limit=TOP_K)` truncated
+    # first, so a row tied on the ranking metric could be dropped before the tie-break ran.
+    scored = []
+    for pid, cand_norm in choices.items():
+        scored.append((pid, float(metric(q_norm, cand_norm, max_extra_tokens=max_extra_tokens))))
 
     id_to_row = {row[strcolumnid]: row for row in candidates}
     out = []
-    for _match, score, pid in matches:
+    for pid, score in scored:
         r = id_to_row[pid]
-        out.append({
-            strcolumnid: r[strcolumnid],
-            strcolumndesc: r[strcolumndesc],
-            strcolumndescnorm: r[strcolumndescnorm],
-            strcolumnpopularity: r.get(strcolumnpopularity),
-            "SCORE": float(score),
-        })
+        # Carry the whole row rather than a four-key whitelist. The whitelist dropped any
+        # other selected column, so `resolve_to_canonical` reached its id only by the accident
+        # that the id doubled as the popularity column; the moment a real popularity was joined
+        # in, the canonical lookup would have started failing silently.
+        entry = dict(r)
+        entry["SCORE"] = score
+        entry["SCORE_WRATIO"] = float(fuzz.WRatio(q_norm, choices[pid]))
+        out.append(entry)
 
     out.sort(
         key=lambda d: (
@@ -630,7 +946,7 @@ def rank_candidates(
             -(d.get(strcolumnpopularity) or 0),
         )
     )
-    return out
+    return out[:TOP_K]
 
 def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]], str]:
     """Decide whether to auto-correct based on the top ranked candidates.
@@ -648,12 +964,22 @@ def decide_autocorrect(ranked: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dic
 
     top1 = ranked[0]
     top2 = ranked[1] if len(ranked) > 1 else None
-    margin = (top1["SCORE"] - top2["SCORE"]) if top2 else 999.0
 
-    if top1["SCORE"] >= AUTO_SCORE and margin >= MIN_MARGIN:
-        return (True, top1, f"auto(score={top1['SCORE']:.1f}, margin={margin:.1f})")
+    # FASTAPI-TEXT2SQL-218: read the WRatio column when present. AUTO_SCORE and MIN_MARGIN
+    # were calibrated on that scale, and `SCORE` now carries the gate's metric, which sits
+    # systematically lower. Reading `SCORE` here would quietly make `require_confident`
+    # unsatisfiable without anyone changing a threshold.
+    def _auto_score(row: Dict[str, Any]) -> float:
+        value = row.get("SCORE_WRATIO")
+        return float(value) if value is not None else float(row["SCORE"])
 
-    return (False, top1, f"suggest(score={top1['SCORE']:.1f}, margin={margin:.1f})")
+    s1 = _auto_score(top1)
+    margin = (s1 - _auto_score(top2)) if top2 else 999.0
+
+    if s1 >= AUTO_SCORE and margin >= MIN_MARGIN:
+        return (True, top1, f"auto(score={s1:.1f}, margin={margin:.1f})")
+
+    return (False, top1, f"suggest(score={s1:.1f}, margin={margin:.1f})")
 
 def search_first_match(
     cur,
@@ -668,6 +994,9 @@ def search_first_match(
     timings_enabled: bool = False,
     bktree: Optional[BKTreeIndex] = None,
     strip_stopwords: bool = False,
+    score_metric: Optional[str] = None,
+    max_extra_tokens: int = DEFAULT_MAX_EXTRA_TOKENS,
+    popularity_join: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Search for a person name and return the best match.
 
@@ -699,10 +1028,30 @@ def search_first_match(
             - timings: dict of timing breakdown (may be empty)
             - candidates_count: number of candidates fetched
     """
-    q_norm = normalize_name(raw)
+    # FASTAPI-TEXT2SQL-236. DEUX chaines, et le partage n'est pas celui qu'on croit.
+    #
+    # q_norm_full : la valeur normalisee, descripteurs COMPRIS. Elle sert aux canaux qui
+    # se comparent a la valeur STOCKEE, laquelle n'est jamais neutralisee : la
+    # correspondance exacte et la cle de prefixe. Avec l'ancien code, chercher le nom
+    # canonique exact « The Criterion Collection » se reduisait a « criterion » et ne
+    # pouvait donc JAMAIS declencher exact_match sur la colonne NORM qui vaut « the
+    # criterion collection ». Un raccourci sur et gratuit etait mort depuis le debut.
+    #
+    # q_norm : la valeur neutralisee, qui sert au plein texte, au LIKE et au classement.
+    # Et ici neutraliser AIDE, contrairement a ce qu'on pourrait croire : le plein texte
+    # est CONJONCTIF (build_boolean_query pose +token* sur chaque mot), donc un
+    # descripteur en plus est une exigence en plus. Sur « star wars universe », la forme
+    # brute exigerait +universe* et EXCLURAIT « Star Wars Collection ». Le LIKE, lui, ne
+    # retient que tokens[0], le mot le plus LONG : sur « collection criterion », la forme
+    # brute donnerait LIKE '%collection%', qui ramene tout.
+    q_norm_full = normalize_name(raw)
+    q_norm = q_norm_full
     if strip_stopwords:
-        q_norm = strip_franchise_words(q_norm)
-    if not q_norm:
+        q_norm = strip_franchise_words(q_norm_full)
+    # Le garde teste la forme COMPLETE : une valeur faite uniquement de descripteurs
+    # ("la collection") laissait la chaine vide et rendait empty_query, donc aucun
+    # candidat. Elle garde desormais ses canaux exact et prefixe.
+    if not q_norm_full:
         return {
             "hit": None,
             "ranked": [],
@@ -713,11 +1062,14 @@ def search_first_match(
             "candidates_count": 0,
         }
 
-    # Derive the prefix key from the (possibly stopword-stripped) q_norm so retrieval
-    # and scoring stay consistent. For the non-strip path this equals to_key(raw).
-    q_key = q_norm.replace(" ", "")
+    # La cle de prefixe se derive de la forme COMPLETE (-236) : la colonne *_KEY stockee
+    # vaut le NORM sans espaces, donc non neutralisee. Une cle neutralisee ne pouvait
+    # correspondre a rien des que la strategie declarait des descripteurs.
+    q_key = q_norm_full.replace(" ", "")
 
     t_exact0 = time.perf_counter() if timings_enabled else 0.0
+    # Exact d'abord, sur la forme COMPLETE : c'est le seul canal qui compare a la valeur
+    # stockee telle quelle, et un succes ici court-circuite tout le reste.
     hit = exact_match(
         cur,
         strtablename,
@@ -725,7 +1077,8 @@ def search_first_match(
         strcolumndesc,
         strcolumndescnorm,
         strcolumnpopularity,
-        q_norm,
+        q_norm_full,
+        popularity_join=popularity_join,
     )
     t_exact1 = time.perf_counter() if timings_enabled else 0.0
     if hit:
@@ -754,6 +1107,7 @@ def search_first_match(
         has_fulltext,
         timings=fetch_t,
         bktree=bktree,
+        popularity_join=popularity_join,
     )
     t_fetch1 = time.perf_counter() if timings_enabled else 0.0
 
@@ -766,6 +1120,8 @@ def search_first_match(
         q_norm,
         candidates,
         strip_stopwords=strip_stopwords,
+        score_metric=score_metric,
+        max_extra_tokens=max_extra_tokens,
     )
     t_rank1 = time.perf_counter() if timings_enabled else 0.0
 

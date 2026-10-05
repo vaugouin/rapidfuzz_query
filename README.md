@@ -4,6 +4,8 @@
 
 The single module [rapidfuzz_query.py](rapidfuzz_query.py) is imported by the `fastapi-text2sql` API to map free-text person names extracted from user questions onto canonical database rows. It also ships an interactive command-line harness (the `main()` loop) for ad-hoc testing against a live database.
 
+**This file is a copy.** The source of truth is `rapidfuzz_query.py` in the `fastapi-text2sql` repository, the copy the API imports. Changes are made there and copied here unchanged, so this CLI resolves names exactly as the API does (RAPIDFUZZ-QUERY-006). Some sections below describe the module as it stood before the 2026-10-05 copy; the code is authoritative.
+
 For agent / contributor conventions see [AGENTS.md](AGENTS.md).
 
 ---
