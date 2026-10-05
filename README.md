@@ -14,7 +14,7 @@ For agent / contributor conventions see [AGENTS.md](AGENTS.md).
 
 Given a raw name string and a target table description, the module:
 
-1. **Normalizes** the input. `normalize_name()` lowercases, replaces every non-alphanumeric character (including punctuation) with a space, and collapses whitespace. `to_key()` further strips all spaces to produce a compact prefix key. These mirror the `STORED` generated columns defined in [T2S_PERSON-rapidfuzz.sql](T2S_PERSON-rapidfuzz.sql) and [T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql](T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql).
+1. **Normalizes** the input. `normalize_name()` lowercases, replaces every character that is neither alphanumeric nor a combining mark (punctuation included) with a space, and collapses whitespace. Combining marks are kept because in Devanagari, Thai, Kannada and the other abugidas the vowels are marks (TMDB-PERSON-PREPROCESS-008). `to_key()` further strips all spaces to produce a compact prefix key. These mirror the `STORED` generated columns defined in [T2S_PERSON-rapidfuzz.sql](T2S_PERSON-rapidfuzz.sql) and [T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql](T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql).
 2. **Tries an exact match** on the normalized column (`PERSON_NAME_NORM`). A hit returns immediately.
 3. **Otherwise builds a candidate pool** via the multi-tier retrieval below.
 4. **Ranks candidates** with RapidFuzz `fuzz.WRatio` and decides whether the top match is strong enough to auto-correct.

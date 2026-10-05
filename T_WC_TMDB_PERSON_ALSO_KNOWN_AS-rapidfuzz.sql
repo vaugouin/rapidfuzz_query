@@ -5,7 +5,7 @@ ALTER TABLE T_WC_TMDB_PERSON_ALSO_KNOWN_AS
       REGEXP_REPLACE(
         REGEXP_REPLACE(
           PERSON_NAME,
-          '[^\\p{L}\\p{N} ]+',  ' '  -- keep Unicode letters/digits/spaces
+          '[^\\p{L}\\p{M}\\p{N} ]+',  ' '  -- keep Unicode letters/marks/digits/spaces (marks: TMDB-PERSON-PREPROCESS-008)
         ),
         ' +', ' '                    -- collapse repeated spaces
       )

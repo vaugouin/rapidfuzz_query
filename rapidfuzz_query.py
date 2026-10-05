@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from typing import List, Dict, Tuple, Any, Optional
 
 try:
@@ -80,7 +81,11 @@ def normalize_name(s: str) -> str:
     """Normalize a person name for matching.
 
     Lowercases, strips, removes non-alphanumeric characters (keeping spaces),
-    and collapses whitespace.
+    and collapses whitespace. Combining marks (Unicode category M) are kept:
+    in Devanagari, Thai, Kannada and the other abugidas the vowels are marks,
+    and dropping them split every word (TMDB-PERSON-PREPROCESS-008). Mirrors
+    the letter/mark/digit class (p{L}, p{M}, p{N}) of the alias tables'
+    PERSON_NAME_NORM generated column.
 
     Args:
         s: Raw input string.
@@ -94,7 +99,7 @@ def normalize_name(s: str) -> str:
 
     out_chars = []
     for ch in s:
-        if ch.isalnum():
+        if ch.isalnum() or unicodedata.category(ch).startswith("M"):
             out_chars.append(ch.lower())
         elif ch.isspace():
             out_chars.append(" ")

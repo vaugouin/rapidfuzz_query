@@ -67,7 +67,7 @@ The module normalizes user input to improve matching quality.
 
 - **`normalize_name(s)`**
   - Lowercases
-  - Removes non-alphanumeric characters (keeps spaces)
+  - Removes non-alphanumeric characters (keeps spaces and combining marks, the vowel signs of Devanagari, Thai, Kannada…; TMDB-PERSON-PREPROCESS-008)
   - Collapses repeated whitespace
 
 - **`to_key(s)`**
