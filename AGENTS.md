@@ -23,7 +23,7 @@ Pipeline stages:
 - **Preprocessing → `T_WC_T2S_*`** — `tmdb-movie-preprocess`, `tmdb-person-preprocess`, `keywords-processing`.
 - **Semantic index & name resolution** — `embedding-update`, `embedding-query`, `rapidfuzz_query`.
 - **Serving** — `fastapi-text2sql` (NL→SQL API + MCP server), `voice-agent`, `tmdb-front` (PHP web front-end).
-- **Evaluation** — `eval-text2sql`, `extract-movie-questions`.
+- **Evaluation** — `text2sql-eval`, `extract-movie-questions`.
 - **Maintenance & tooling** — `plex-duplicates`, `subtitle-translate`, `powershell`, `playwright-test`.
 - **Monitoring & observability** — `data-monitoring`, `pipeline-3d` (three.js replay of one question's execution trace through `voice-agent` and `fastapi-text2sql`).
 
