@@ -15,9 +15,9 @@ For agent / contributor conventions see [AGENTS.md](AGENTS.md).
 Given a raw name string and a target table description, the module:
 
 1. **Normalizes** the input. `normalize_name()` lowercases, replaces every character that is neither alphanumeric nor a combining mark (punctuation included) with a space, and collapses whitespace. Combining marks are kept because in Devanagari, Thai, Kannada and the other abugidas the vowels are marks (TMDB-PERSON-PREPROCESS-008). `to_key()` further strips all spaces to produce a compact prefix key. These mirror the `STORED` generated columns defined in [T2S_PERSON-rapidfuzz.sql](T2S_PERSON-rapidfuzz.sql) and [T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql](T_WC_TMDB_PERSON_ALSO_KNOWN_AS-rapidfuzz.sql).
-2. **Tries an exact match** on the normalized column (`PERSON_NAME_NORM`). A hit returns immediately.
+2. **Tries an exact match** on the normalized column (`PERSON_NAME_NORM`), with the full normalized form (franchise words kept even when the target strips them, since the stored column never does). A hit returns immediately.
 3. **Otherwise builds a candidate pool** via the multi-tier retrieval below.
-4. **Ranks candidates** with RapidFuzz `fuzz.WRatio` and decides whether the top match is strong enough to auto-correct.
+4. **Ranks candidates** with a configurable RapidFuzz metric (`fuzz.ratio` by default) and decides, on the `fuzz.WRatio` scale, whether the top match is strong enough to auto-correct.
 
 ### Candidate-retrieval strategy
 
@@ -32,7 +32,7 @@ Each tier de-duplicates against ids already in the pool. When `timings` are enab
 
 ### Ranking
 
-`rank_candidates()` scores the normalized query against each candidate's normalized name using `rapidfuzz.process.extract` with `scorer=fuzz.WRatio`, keeping the top `TOP_K` (10). Results are sorted by descending `SCORE`, with the popularity column (`POPULARITY`) as a tie-breaker.
+`rank_candidates()` scores the normalized query against each candidate's normalized name with the metric named by `score_metric` (`SCORE_METRICS`: `ratio`, the default, is `fuzz.ratio`; `token_subset` also scores 100 for a strict token inclusion with at most `max_extra_tokens` extra tokens, generational suffixes such as `jr` ignored). The whole pool is scored, sorted by descending `SCORE` with the popularity column as a tie-breaker, then cut to `TOP_K` (10). Each row also carries `SCORE_WRATIO` (`fuzz.WRatio`), which the auto-correction decision reads (FASTAPI-TEXT2SQL-218).
 
 ---
 
@@ -57,6 +57,10 @@ search_first_match(
     has_fulltext,              # bool: is a FULLTEXT index present?
     timings_enabled=False,
     bktree=None,               # optional pre-built BKTreeIndex
+    strip_stopwords=False,     # neutralize franchise words (collections)
+    score_metric=None,         # name in SCORE_METRICS, default "ratio"
+    max_extra_tokens=1,        # for the token_subset metric
+    popularity_join=None,      # optional join supplying the popularity column
 ) -> dict
 ```
 
@@ -65,7 +69,7 @@ Returns a dict with this shape:
 | Key | Type | Meaning |
 |-----|------|---------|
 | `hit` | row dict or `None` | exact normalized match (when found) |
-| `ranked` | list of dicts | ranked suggestions, each with the id/desc/norm/popularity fields plus a `SCORE` float (empty when there was an exact hit or no candidates) |
+| `ranked` | list of dicts | ranked suggestions, each with the id/desc/norm/popularity fields plus `SCORE` (ranking metric) and `SCORE_WRATIO` floats (empty when there was an exact hit or no candidates) |
 | `auto` | bool | whether the result is confident enough to auto-correct (always `True` for an exact `hit`) |
 | `best` | row dict or `None` | top suggestion (the `hit` itself on an exact match) |
 | `reason` | str | `exact`, `empty_query`, `no_candidates`, `auto(score=..., margin=...)`, or `suggest(score=..., margin=...)` |
@@ -83,11 +87,11 @@ A higher-level, config-driven wrapper used by callers such as `fastapi-text2sql`
 }
 ```
 
-The `search` sub-config carries the column mapping (`table`, `id`, `desc`, `norm`, `key`, `pop`) plus the resolved `has_fulltext` flag and an optional pre-built `bktree`. Optional `enrich` steps perform config-driven secondary lookups (e.g. attaching the canonical person row to an "also known as" alias hit); `enrich_mode` is `best_only` (default) or `all_ranked`.
+The `search` sub-config carries the column mapping (`table`, `id`, `desc`, `norm`, `key`, `pop`) plus the resolved `has_fulltext` flag, an optional pre-built `bktree` and the optional `strip_franchise_stopwords` flag. It does not pass a `score_metric`, so the default `ratio` ranks. Optional `enrich` steps perform config-driven secondary lookups (e.g. attaching the canonical person row to an "also known as" alias hit); `enrich_mode` is `best_only` (default) or `all_ranked`.
 
 ### Helpers
 
-`normalize_name()`, `to_key()`, `build_boolean_query()`, `exact_match()`, `fetch_candidates()`, `rank_candidates()`, `decide_autocorrect()`, the `BKTreeIndex` class, `build_bktree_for_config()`, `db_has_norm_columns()`, `db_has_fulltext()`, `db_lookup_by_id()`, `enrich_match_object()`, and `get_db_connection()` are also exported.
+`normalize_name()`, `to_key()`, `build_boolean_query()`, `exact_match()`, `fetch_candidates()`, `rank_candidates()`, `decide_autocorrect()`, the `BKTreeIndex` class, `build_bktree_for_config()`, `db_has_norm_columns()`, `db_has_fulltext()`, `db_lookup_by_id()`, `enrich_match_object()`, and `get_db_connection()` are also exported, along with `strip_franchise_words()`, `normalize_collection_name()`, the score metrics (`score_ratio()`, `score_token_subset()`, `resolve_score_metric()`) and the rescue normalizers (`apply_rescue_normalizers()` and the `normalize_apostrophes/accents/dashes/punctuation()` functions it chains).
 
 ---
 
@@ -95,7 +99,7 @@ The `search` sub-config carries the column mapping (`table`, `id`, `desc`, `norm
 
 `decide_autocorrect()` inspects the ranked list using two thresholds:
 
-- **`AUTO_SCORE = 90`** — the top candidate's WRatio score must be at least this high.
+- **`AUTO_SCORE = 90`** — the top candidate's WRatio score (`SCORE_WRATIO`, not the ranking `SCORE`) must be at least this high.
 - **`MIN_MARGIN = 5`** — the gap between the top and second candidate's scores must be at least this large (if there is only one candidate, the margin is treated as effectively infinite).
 
 If both conditions hold, the result is `auto=True` with reason `auto(score=..., margin=...)`; otherwise `auto=False` with reason `suggest(score=..., margin=...)` and the top candidate is still returned as `best` for display as a suggestion. These constants are module-level in [rapidfuzz_query.py](rapidfuzz_query.py) and can be tuned.

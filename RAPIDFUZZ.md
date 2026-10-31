@@ -243,10 +243,10 @@ pool.
 
 Ranking is done with:
 
-- `rapidfuzz.process.extract()`
-- scorer: **`rapidfuzz.fuzz.WRatio`**
+- the metric named by `score_metric`, from `SCORE_METRICS`: **`ratio`** (`rapidfuzz.fuzz.ratio`, the default) or **`token_subset`** (`ratio`, except that a strict token inclusion with at most `max_extra_tokens` extra tokens scores 100)
+- a `SCORE_WRATIO` column (`rapidfuzz.fuzz.WRatio`) computed alongside, read by the auto-correct decision below (FASTAPI-TEXT2SQL-218)
 
-The module builds a `choices` dictionary of `{ID -> normalized_string}` and extracts the top `TOP_K` matches.
+The module builds a `choices` dictionary of `{ID -> normalized_string}`, scores the whole pool, sorts it, then keeps the top `TOP_K` matches.
 
 ### Tie-breaker: POPULARITY
 
@@ -263,7 +263,7 @@ This is implemented by sorting the ranked list by:
 
 The module can decide whether it is confident enough to auto-correct.
 
-- **`AUTO_SCORE`**: minimum score to auto-correct
+- **`AUTO_SCORE`**: minimum score to auto-correct, read on `SCORE_WRATIO` (the scale it was calibrated on), not on the ranking `SCORE`
 - **`MIN_MARGIN`**: `top1_score - top2_score` must be >= this margin
 
 Function:
@@ -309,6 +309,11 @@ search_first_match(
     raw: str,
     has_fulltext: bool,
     timings_enabled: bool = False,
+    bktree: Optional[BKTreeIndex] = None,
+    strip_stopwords: bool = False,
+    score_metric: Optional[str] = None,
+    max_extra_tokens: int = DEFAULT_MAX_EXTRA_TOKENS,
+    popularity_join: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]
 ```
 
