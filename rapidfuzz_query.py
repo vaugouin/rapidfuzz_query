@@ -729,9 +729,10 @@ def exact_match(
     """
     # Exact match on normalized form (fast with index on PERSON_NAME_NORM).
     # FASTAPI-TEXT2SQL-293: a normalized form can belong to several rows (12,188 forms of the
-    # person alias table were shared by several persons on 2026-11-05). The bare LIMIT 1
-    # returned whichever row InnoDB met first; the most popular one now wins, as in the fuzzy
-    # ranking, then the lowest id. Same change as fastapi-text2sql/rapidfuzz_query.py.
+    # person alias table were shared by several persons on 2026-11-05, and the Wikidata aliases
+    # of TMDB-MOVIE-PREPROCESS-070 add more). The bare LIMIT 1 returned whichever row InnoDB met
+    # first; the most popular one now wins, as in the fuzzy ranking, then the lowest id so the
+    # answer is the same from one call to the next.
     cur.execute(
         build_select_prefix(
             strtablename, strcolumnid, strcolumndesc, strcolumndescnorm,

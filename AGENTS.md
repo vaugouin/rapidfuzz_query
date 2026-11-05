@@ -26,7 +26,7 @@ Name-resolution stage of **Agent BBB** (`github.com/vaugouin/<repo>`, cloned und
 ---
 
 **Last Updated**: 2026-11-05
-**Current Version**: 1.0.4
+**Current Version**: 1.0.5
 
 ## Backlog (Nestor second-brain)
 
