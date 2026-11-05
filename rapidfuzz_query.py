@@ -727,13 +727,18 @@ def exact_match(
     Returns:
         A row dict if found, else None.
     """
-    # Exact match on normalized form (fast with index on PERSON_NAME_NORM)
+    # Exact match on normalized form (fast with index on PERSON_NAME_NORM).
+    # FASTAPI-TEXT2SQL-293: a normalized form can belong to several rows (12,188 forms of the
+    # person alias table were shared by several persons on 2026-11-05). The bare LIMIT 1
+    # returned whichever row InnoDB met first; the most popular one now wins, as in the fuzzy
+    # ranking, then the lowest id. Same change as fastapi-text2sql/rapidfuzz_query.py.
     cur.execute(
         build_select_prefix(
             strtablename, strcolumnid, strcolumndesc, strcolumndescnorm,
             strcolumnpopularity, popularity_join,
         )
-        + f"WHERE `t`.`{strcolumndescnorm}` = %s LIMIT 1",
+        + f"WHERE `t`.`{strcolumndescnorm}` = %s "
+        + f"ORDER BY `{strcolumnpopularity}` DESC, `t`.`{strcolumnid}` ASC LIMIT 1",
         (q_norm,),
     )
     row = cur.fetchone()
